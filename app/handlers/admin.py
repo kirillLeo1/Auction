@@ -206,13 +206,16 @@ async def _publish_lot(pub_id: int, bot: Bot):
         link_text = "Купити" if is_sale else "Бронь"
         deeplink = f"https://t.me/{me.username}?start={'sale' if is_sale else 'lot'}_{lot.public_id}"
 
+        step_line = "" if is_sale else "Крок: 15 грн\n"   # <-- окремим рядком, без f-виразу
+
         caption = (
             f"<b>{lot.title}</b>\n\n"
             f"{'Ціна' if is_sale else 'Поточна ціна'}: <b>{lot.current_price} грн</b>\n"
-            f"{'' if is_sale else 'Крок: 15 грн\\n'}\n"
+            f"{step_line}"
             f"<a href=\"{deeplink}\">{link_text}</a>\n\n"
             f"ID лота — #{lot.public_id}"
         )
+
 
         # постимо у канал
         if lot.photos:
@@ -315,7 +318,7 @@ async def finish_all(msg: Message, bot: Bot):
             deeplink = f"https://t.me/{me.username}?start=sale_{lot.public_id}"
             caption = (
                 f"<b>{lot.title}</b>\n\n"
-                f"Ціна: <b>{lot.current_price} грн</b>\n\n"
+                f"Ціна: <b>{lot.current_price} грн</b>\n"
                 f"<a href=\"{deeplink}\">Купити</a>\n\n"
                 f"ID лота — #{lot.public_id}"
             )
