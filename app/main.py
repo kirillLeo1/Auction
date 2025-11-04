@@ -3,17 +3,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from aiogram import Bot, Dispatcher
-from aiogram.types import Update
-from sqlalchemy import select, func as _func
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.base import StorageKey
+from sqlalchemy import select
+from sqlalchemy import func as _func
 
 from app.settings import settings
 from app.db import init_models, async_session
 from app.handlers.admin import admin_router
 from app.handlers.user import user_router
+from app.handlers.user import ContactOneSG   # <- одношагова форма
 from app.services.cascade import advance_cascade
 from app.models import Offer, OfferStatus, Lot
 from app.services.monopay import verify_webhook_signature
-from aiogram.client.default import DefaultBotProperties
 
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -49,24 +51,26 @@ async def health():
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────
-# Єдина реалізація логіки вебхука (щоб викликати з двох шляхів)
+# Єдина реалізація логіки вебхука (працює і для /monopay/webhook,
+# і для /telegram/webhook/monopay/webhook як "страховка")
 async def _handle_monopay_webhook(request: Request) -> str:
     raw = await request.body()
     x_sign = request.headers.get("X-Sign")
+
     if not x_sign or not await verify_webhook_signature(raw, x_sign):
         raise HTTPException(400, "Bad signature")
 
     offer_id = int(request.query_params.get("offer_id", "0"))
     data = await request.json()
     status = data.get("status")        # created / processing / success / failure
-    invoice_id = data.get("invoiceId") # без цього інколи не приходить — але у нас перевірка є
+    invoice_id = data.get("invoiceId")
 
     async with async_session() as session:
         off = await session.get(Offer, offer_id)
         if not off:
-            return "ok"  # нічого не знаємо про цей offer_id
+            return "ok"
 
-        # якщо Mono відправила вебхук не по тій інвойс-id – ігноруємо, але не падаємо
+        # якщо Mono прислала іншу invoiceId — ігноруємо
         if off.invoice_id and invoice_id and off.invoice_id != invoice_id:
             return "ok"
 
@@ -78,7 +82,7 @@ async def _handle_monopay_webhook(request: Request) -> str:
 
             lot = await session.get(Lot, off.lot_id)
 
-            # якщо все продано — прибираємо решту «бронь» і видаляємо пост з каналу
+            # якщо товарів більше нема — скасовуємо інші броні і видаляємо пост з каналу
             paid_cnt = (await session.execute(
                 select(_func.count()).select_from(Offer)
                 .where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID)
@@ -93,35 +97,44 @@ async def _handle_monopay_webhook(request: Request) -> str:
                 )).scalars().all()
                 for o in others:
                     o.status = OfferStatus.CANCELED
-
-                # видаляємо пост з каналу (і для аукціону, і для розпродажу)
                 if lot.channel_id and lot.channel_message_id:
                     try:
                         await bot.delete_message(lot.channel_id, lot.channel_message_id)
                     except Exception:
                         pass
 
-            # даємо лінк на форму контактів
+            # БЕЗ ЖОДНИХ ДІПЛІНКІВ: ставимо користувачу стан одношагової форми
+            me = await bot.get_me()
+            key = StorageKey(
+                chat_id=off.user_tg_id,
+                user_id=off.user_tg_id,
+                bot_id=me.id,
+            )
+            await dp.fsm.storage.set_state(key, ContactOneSG.ONE)
+            await dp.fsm.storage.set_data(key, {"offer_id": off.id})
+
+            # просимо ввести дані одним повідомленням
+            prompt = (
+                "✅ Оплату зараховано!\n\n"
+                "Введіть, будь ласка, ОДНИМ повідомленням:\n"
+                "ПІБ / місто / відділення (або адреса) / телефон\n\n"
+                "Приклад:\n"
+                "Іван Іванов\nКиїв\nНП Відділення 12\n+380XXXXXXXXX"
+            )
             try:
-                me = await bot.get_me()
-                link = f"https://t.me/{me.username}?start=contact_{off.id}"
-                await bot.send_message(
-                    off.user_tg_id,
-                    f"✅ Оплату за лот #{lot.public_id} зараховано!\n"
-                    f"Натисніть, щоб заповнити контактні дані: {link}"
-                )
+                await bot.send_message(off.user_tg_id, prompt)
             except Exception:
                 pass
 
-        # інші статуси теж «ok», щоб Mono не ретраїла безкінечно
         await session.commit()
+
     return "ok"
 
-# Правильний шлях (як у create_invoice)
 @app.post("/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook(request: Request):
     return await _handle_monopay_webhook(request)
 
+# альтернативний шлях, якщо десь випадково у BASE_URL був префікс
 @app.post("/telegram/webhook/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook_alt(request: Request):
     return await _handle_monopay_webhook(request)
