@@ -23,7 +23,8 @@ class BidSG(StatesGroup):
 
 
 class ContactOneSG(StatesGroup):
-    ONE = State()  # один крок: «ПІБ / місто / відділення або адреса / телефон / коментар…» (будь-що)
+    # один крок: «ПІБ / місто / відділення або адреса / телефон / коментар…» (будь-що)
+    ONE = State()
 
 
 # ─────────── helpers
@@ -40,19 +41,7 @@ async def start_entry(msg: Message, state: FSMContext, bot: Bot):
     if len(parts) == 2:
         arg = parts[1].strip()
 
-    # після успішної оплати: запит одноразової контакт-форми
-    if arg.startswith("contact_"):
-        offer_id = int(arg.split("_", 1)[1])
-        await state.update_data(offer_id=offer_id)
-        await state.set_state(ContactOneSG.ONE)
-        await msg.answer(
-            "Введіть ваші дані одним повідомленням (будь-який формат).\n\n"
-            "Приклад:\n"
-            "ПІБ: Іван Іванов\nМісто/область: Київ\n"
-            "Доставка: НП відділення 45 (або адреса)\nТелефон: +380XXXXXXXXX\nКоментар: …"
-        )
-        return
-
+    # УВАГА: НЕ приймаємо contact_* (це робить вебхук без лінків).
     # РОЗПРОДАЖ (фіксована ціна: Купити)
     if arg.startswith("sale_"):
         pub_id = int(arg.split("_", 1)[1])
@@ -293,11 +282,11 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
         await session.flush()
 
         # Забираємо лот разом із фото
-        from sqlalchemy import select
+        from sqlalchemy import select as _select
         from sqlalchemy.orm import selectinload
         lot = (
             await session.execute(
-                select(Lot)
+                _select(Lot)
                 .options(selectinload(Lot.photos))
                 .where(Lot.id == off.lot_id)
             )
@@ -363,5 +352,5 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
 
-    await msg.answer("Дякуємо! Дані отримано. Менеджер вже бачить ваш лот і заявку.")
+    await msg.answer("Дякуємо! Дані отримано. Менеджер вже бачить вашу заявку.")
     await state.clear()
