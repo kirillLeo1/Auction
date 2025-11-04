@@ -1,15 +1,17 @@
 from datetime import datetime, timedelta
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, and_
+from sqlalchemy.orm import selectinload
 from aiogram import Bot
-from aiogram.types import Message
 from app.db import async_session
 from app.models import Lot, Bid, Offer, OfferStatus, LotStatus
 from app.settings import settings
 from app.services.monopay import create_invoice
-from app.utils import tri_buttons
+from app.utils import tri_buttons, update_channel_caption
+
+REMINDER_BEFORE_HOURS = 5
 
 async def start_cascade(bot: Bot, lot_id: int):
-    """Compute ranking, create offers for top N = quantity, DM users with 3 buttons."""
+    """Формуємо рейтинґ з MAX-ставок, створюємо офери для топ-N=quantity і шлемо 3 кнопки."""
     async with async_session() as session:
         lot = await session.get(Lot, lot_id)
         if not lot:
@@ -17,7 +19,11 @@ async def start_cascade(bot: Bot, lot_id: int):
         lot.status = LotStatus.FINISHED
         await session.flush()
 
-        # ranking by each user's MAX bid
+        # Якщо це розпродаж (min_step==0), каскад не запускаємо
+        if lot.min_step == 0:
+            await session.commit()
+            return
+
         stmt = (
             select(Bid.user_tg_id, func.max(Bid.amount).label("mx"))
             .where(Bid.lot_id == lot_id)
@@ -31,14 +37,10 @@ async def start_cascade(bot: Bot, lot_id: int):
 
         now = datetime.utcnow()
         hold = timedelta(hours=settings.HOLD_HOURS)
-
-        # how many items remain
         remaining = lot.quantity
-
         rank = 0
         for user_tg_id, mx in res:
             rank += 1
-            # prepare offer row but DM only top `remaining`
             offer = Offer(
                 lot_id=lot.id,
                 user_tg_id=user_tg_id,
@@ -59,48 +61,79 @@ async def start_cascade(bot: Bot, lot_id: int):
                 )
                 offer.invoice_id = inv_id
                 offer.invoice_url = page_url
-                # notify user
+                kb = tri_buttons(page_url, f"postpone:{offer.id}", f"decline:{offer.id}")
                 txt = (
                     f"Ви у каскаді переможців лота <b>#{lot.public_id}</b>\n"
                     f"Сума до оплати: <b>{mx} грн</b>\n"
-                    f"Тримаємо за вами до: <b>{(now+hold).strftime('%d.%m %H:%M')}</b> (за Києвом)"
+                    f"Тримаємо за вами до: <b>{(now+hold).strftime('%d.%m %H:%M')}</b> (Київ)"
                 )
-                kb = tri_buttons(page_url, f"postpone:{offer.id}", f"decline:{offer.id}")
                 try:
-                    await bot.send_message(chat_id=user_tg_id, text=txt, reply_markup=kb, parse_mode="HTML")
+                    await bot.send_message(user_tg_id, txt, reply_markup=kb, parse_mode="HTML")
                 except Exception:
                     pass
         await session.commit()
 
 async def advance_cascade(bot: Bot):
-    """Periodic checker: expire old offers, open next ones until items sold out."""
-    from sqlalchemy import and_, select
-    from datetime import datetime
+    """Періодичний чекер: EXPIRE, нагадування за 5 год, відкриття наступних кандидатів,
+    і видалення поста з каналу коли все викуплено (бекап до вебхука)."""
+    now = datetime.utcnow()
     async with async_session() as session:
-        now = datetime.utcnow()
-        # expire
-        q = select(Offer).where(Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED]), Offer.hold_until < now)
-        for off in (await session.execute(q)).scalars().all():
+        # 1) Нагадування за 5 годин до дедлайну
+        q_rem = select(Offer).where(
+            Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED]),
+            Offer.hold_until.is_not(None)
+        )
+        for off in (await session.execute(q_rem)).scalars().all():
+            if off.hold_until and not off.reminder_sent:
+                delta = off.hold_until - now
+                if delta <= timedelta(hours=REMINDER_BEFORE_HOURS) and delta > timedelta(seconds=0):
+                    try:
+                        await bot.send_message(
+                            off.user_tg_id,
+                            "Ваша бронь ще дійсна протягом 5 годин, після чого буде скасована. За скасовані броні блокуємо. Дякуємо за розуміння.")
+                    except Exception:
+                        pass
+                    off.reminder_sent = True
+        await session.flush()
+
+        # 2) Прострочені → EXPIRED
+        q_exp = select(Offer).where(
+            Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED]),
+            Offer.hold_until.is_not(None),
+            Offer.hold_until < now,
+        )
+        for off in (await session.execute(q_exp)).scalars().all():
             off.status = OfferStatus.EXPIRED
         await session.flush()
 
-        # for each finished lot, ensure number of ACTIVE offers (offered/postponed) equals remaining quantity; if less, open next by rank
-        lots = (await session.execute(select(Lot).where(Lot.status == LotStatus.FINISHED))).scalars().all()
+        # 3) Для кожного FINISHED-лоту тримаємо активних оферів рівно стільки, скільки лишилось одиниць
+        lots = (await session.execute(select(Lot))).scalars().all()
         for lot in lots:
-            # count paid
-            paid = (await session.execute(select(func.count()).select_from(Offer).where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID))).scalar_one()
-            remaining = max(lot.quantity - paid, 0)
-            active = (await session.execute(select(func.count()).select_from(Offer).where(Offer.lot_id == lot.id, Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])))).scalar_one()
-            if remaining > active:
-                need = remaining - active
-                # find next candidates by rank not yet offered/paid/declined/expired/canceled
-                qnext = select(Offer).where(Offer.lot_id == lot.id, Offer.status == OfferStatus.CANCELED).order_by(Offer.rank_index)
-                candidates = (await session.execute(qnext)).scalars().all()
-                for off in candidates[:need]:
+            # видалення поста якщо все викуплено
+            paid_cnt = (await session.execute(select(func.count()).select_from(Offer).where(Offer.lot_id==lot.id, Offer.status==OfferStatus.PAID))).scalar_one()
+            if lot.channel_id and lot.channel_message_id and paid_cnt >= lot.quantity:
+                try:
+                    await bot.delete_message(lot.channel_id, lot.channel_message_id)
+                except Exception:
+                    pass
+
+            if lot.status != LotStatus.FINISHED:
+                continue
+            remaining = max(lot.quantity - paid_cnt, 0)
+            active_cnt = (
+                await session.execute(
+                    select(func.count()).select_from(Offer).where(
+                        Offer.lot_id==lot.id,
+                        Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])
+                    )
+                )
+            ).scalar_one()
+            if remaining > active_cnt:
+                need = remaining - active_cnt
+                qnext = select(Offer).where(Offer.lot_id==lot.id, Offer.status==OfferStatus.CANCELED).order_by(Offer.rank_index)
+                for off in (await session.execute(qnext)).scalars().all()[:need]:
                     off.status = OfferStatus.OFFERED
-                    from datetime import timedelta
                     off.hold_until = datetime.utcnow() + timedelta(hours=settings.HOLD_HOURS)
-                    # create invoice and DM
                     inv_id, page_url = await create_invoice(
                         amount_uah=off.offered_price,
                         reference=f"lot#{lot.public_id}-user{off.user_tg_id}-offer{off.id}",
@@ -110,14 +143,9 @@ async def advance_cascade(bot: Bot):
                     )
                     off.invoice_id = inv_id
                     off.invoice_url = page_url
-                    txt = (
-                        f"Черга дійшла до вас по лоту <b>#{lot.public_id}</b>\n"
-                        f"Сума до оплати: <b>{off.offered_price} грн</b>\n"
-                        f"Тримаємо до: <b>{off.hold_until.strftime('%d.%m %H:%M')}</b>"
-                    )
                     kb = tri_buttons(page_url, f"postpone:{off.id}", f"decline:{off.id}")
                     try:
-                        await bot.send_message(off.user_tg_id, txt, reply_markup=kb, parse_mode="HTML")
+                        await bot.send_message(off.user_tg_id, f"Черга дійшла до вас по лоту #{lot.public_id}. Сума до оплати: {off.offered_price} грн", reply_markup=kb)
                     except Exception:
                         pass
         await session.commit()

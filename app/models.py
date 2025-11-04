@@ -17,7 +17,7 @@ class OfferStatus(str, PyEnum):
     PAID = "paid"
     DECLINED = "declined"
     EXPIRED = "expired"
-    CANCELED = "canceled"  # when items sold out and others invalidated
+    CANCELED = "canceled"  # коли товар закінчився, решту інвалідуємо
 
 class User(Base):
     __tablename__ = "users"
@@ -32,10 +32,13 @@ class Lot(Base):
     __tablename__ = "lots"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     public_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    # Весь опис зберігаємо в title (за новими вимогами)
     title: Mapped[str] = mapped_column(String(200))
-    condition: Mapped[str] = mapped_column(String(200))
-    size: Mapped[str] = mapped_column(String(200))
+    # поля залишаємо, але не використовуємо в новому майстрі
+    condition: Mapped[str] = mapped_column(String(200), default="")
+    size: Mapped[str] = mapped_column(String(200), default="")
     start_price: Mapped[int] = mapped_column(Integer)
+    # Якщо min_step == 0 → це режим Розпродаж (SALE, кнопка «Купити»)
     min_step: Mapped[int] = mapped_column(Integer)
     quantity: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(Enum(LotStatus), default=LotStatus.DRAFT)
@@ -73,16 +76,19 @@ class Offer(Base):
     lot_id: Mapped[int] = mapped_column(ForeignKey("lots.id", ondelete="CASCADE"), index=True)
     user_tg_id: Mapped[int] = mapped_column(BigInteger, index=True)
     offered_price: Mapped[int] = mapped_column(Integer)
-    rank_index: Mapped[int] = mapped_column(Integer)  # 1=highest bidder
+    rank_index: Mapped[int] = mapped_column(Integer)  # 1=топ-претендент
     status: Mapped[str] = mapped_column(Enum(OfferStatus), default=OfferStatus.OFFERED, index=True)
     hold_until: Mapped[datetime | None] = mapped_column(DateTime)
     invoice_id: Mapped[str | None] = mapped_column(String(64), index=True)
     invoice_url: Mapped[str | None] = mapped_column(String(256))
     paid_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # one-shot форма контактів (Part 2 буде збереження)
     contact_fullname: Mapped[str | None] = mapped_column(String(200))
     contact_phone: Mapped[str | None] = mapped_column(String(64))
     contact_city_region: Mapped[str | None] = mapped_column(String(200))
-    contact_delivery: Mapped[str | None] = mapped_column(String(64))  # Nova Poshta: branch/postomat/address
+    contact_delivery: Mapped[str | None] = mapped_column(String(64))
     contact_address: Mapped[str | None] = mapped_column(String(200))
     contact_comment: Mapped[str | None] = mapped_column(Text)
+    # нагадування за 5 годин до дедлайну
+    reminder_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     lot: Mapped[Lot] = relationship(back_populates="offers")
