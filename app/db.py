@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from app.settings import settings
+from sqlalchemy import text
 
 class Base(DeclarativeBase):
     pass
@@ -12,3 +13,7 @@ async def init_models():
     from app import models  # noqa
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # разово додамо колонку для нагадувань, якщо її ще нема
+        await conn.execute(text(
+            "ALTER TABLE offers ADD COLUMN IF NOT EXISTS reminder_sent boolean DEFAULT false"
+        ))
