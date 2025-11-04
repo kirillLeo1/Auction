@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import datetime, timedelta
 
 from aiogram import Router, F, Bot
@@ -24,7 +23,7 @@ class BidSG(StatesGroup):
 
 
 class ContactOneSG(StatesGroup):
-    ONE = State()  # "ПІБ / місто / відділення НП/УП або адреса / телефон"
+    ONE = State()  # один крок: «ПІБ / місто / відділення або адреса / телефон / коментар…» (будь-що)
 
 
 # ─────────── helpers
@@ -47,10 +46,10 @@ async def start_entry(msg: Message, state: FSMContext, bot: Bot):
         await state.update_data(offer_id=offer_id)
         await state.set_state(ContactOneSG.ONE)
         await msg.answer(
-            "Введіть ваші дані одним повідомленням:\n"
-            "<i>ПІБ / місто / відділення НП/УП або адреса / телефон</i>\n\n"
-            "Наприклад: Іван Іванов / Київ / НП відділення 45 / +380991112233",
-            parse_mode="HTML",
+            "Введіть ваші дані одним повідомленням (будь-який формат).\n\n"
+            "Приклад:\n"
+            "ПІБ: Іван Іванов\nМісто/область: Київ\n"
+            "Доставка: НП відділення 45 (або адреса)\nТелефон: +380XXXXXXXXX\nКоментар: …"
         )
         return
 
@@ -115,11 +114,10 @@ async def start_entry(msg: Message, state: FSMContext, bot: Bot):
             await session.commit()
 
         kb = tri_buttons(page_url, f"postpone:{offer.id}", f"decline:{offer.id}")
-        hold_text = offer.hold_until.strftime("%d.%m %H:%M") if offer.hold_until else "—"
         await msg.answer(
             f"Лот #{lot.public_id}: {lot.title}\n\n"
             f"Ціна до оплати: <b>{offer.offered_price} грн</b>\n"
-            f"Тримаємо за вами до <b>{hold_text}</b> (Київ).",
+            f"Оплатити потрібно протягом {settings.HOLD_HOURS} годин.",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -247,14 +245,15 @@ async def cb_postpone(call: CallbackQuery, state: FSMContext):
             await call.answer("Недійсно", show_alert=True)
             return
         off.status = OfferStatus.POSTPONED
+        # якщо чомусь не стоїть дедлайн — виставимо 24 години від зараз
+        if not off.hold_until:
+            off.hold_until = datetime.utcnow() + timedelta(hours=settings.HOLD_HOURS)
         await session.commit()
 
     await state.update_data(offer_id=offer_id)
     await state.set_state(ContactOneSG.ONE)
     await call.message.answer(
-        "Введіть ваші дані одним повідомленням:\n"
-        "<i>ПІБ / місто / відділення НП/УП або адреса / телефон</i>",
-        parse_mode="HTML",
+        "Окей, відкладаємо. Надішліть ваші дані одним повідомленням (будь-який формат, приклад є у /start)."
     )
     await call.answer()
 
@@ -282,49 +281,42 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     offer_id = int(data.get("offer_id", 0))
 
-    # розбиваємо по "/" або "|"
-    parts = [p.strip() for p in re.split(r"[|/]", msg.text) if p.strip()]
-    if len(parts) < 4:
-        await msg.answer(
-            "Будь ласка, відправте у форматі: "
-            "<code>ПІБ / місто / відділення НП або адреса / телефон</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    fullname, city, address, phone = parts[0], parts[1], parts[2], parts[3]
-
     async with async_session() as session:
         off = await session.get(Offer, offer_id)
         if not off:
             await msg.answer("Посилання застаріло. Спробуйте ще раз /start")
             await state.clear()
             return
-        off.contact_fullname = fullname
-        off.contact_city_region = city
-        off.contact_address = address
-        off.contact_phone = phone
-        off.contact_delivery = "НП/УП або адресна"
+        # Приймаємо будь-яке повідомлення як «дані покупця»
+        off.contact_comment = msg.text
         await session.flush()
         lot = await session.get(Lot, off.lot_id)
         await session.commit()
 
-    # лише менеджерський чат
-    if settings.MANAGER_CHAT_ID:
-        tag = "Оплачено" if off.status == OfferStatus.PAID else "Відкладено"
-        user_link = (
-            f"@{msg.from_user.username}"
-            if msg.from_user.username
-            else str(msg.from_user.id)
-        )
-        txt = (
-            f"{tag} | Лот #{lot.public_id} | {user_link} | {off.offered_price} грн\n"
-            f"ПІБ: {fullname}\nМісто: {city}\nАдреса/Відділення: {address}\nТелефон: {phone}"
-        )
-        try:
-            await bot.send_message(settings.MANAGER_CHAT_ID, txt)
-        except Exception:
-            pass
+    # Надсилаємо карточку в менеджерський чат (або адмінам, якщо чат не задано)
+    tag = "Оплачено" if off.status == OfferStatus.PAID else "Відкладено"
+    user_link = (
+        f"@{msg.from_user.username}" if msg.from_user.username else str(msg.from_user.id)
+    )
+    card = (
+        f"{tag} | Лот #{lot.public_id} | Юзер {user_link}\n"
+        f"Сума: {off.offered_price} грн\n"
+        f"Дані покупця:\n{msg.text}"
+    )
 
-    await msg.answer("Дякуємо! Замовлення передано менеджеру.")
+    sent = False
+    if settings.MANAGER_CHAT_ID:
+        try:
+            await bot.send_message(settings.MANAGER_CHAT_ID, card)
+            sent = True
+        except Exception:
+            sent = False
+    if not sent:
+        for adm in settings.admin_id_set:
+            try:
+                await bot.send_message(adm, card)
+            except Exception:
+                pass
+
+    await msg.answer("Дякуємо! Дані отримано. Менеджер скоро зв’яжеться.")
     await state.clear()
