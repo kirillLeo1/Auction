@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-import asyncio
+# app/handlers/admin.py
 from aiogram import Router, F, Bot
 from aiogram.types import Message, ContentType, InputMediaPhoto
 from aiogram.fsm.state import StatesGroup, State
@@ -12,11 +10,12 @@ from app.db import async_session
 from app.models import Lot, LotPhoto, LotStatus, Bid
 from app.settings import settings
 from app.utils import update_channel_caption
+from app.services.cascade import start_cascade
 
 admin_router = Router()
 
 
-# ─────────────── Спрощений створювач лота (опис → ціна → кількість → фото → batch)
+# ─────────────── Спрощений створювач лота (опис → ціна → кількість → фото → підтвердження)
 class CreateItemSG(StatesGroup):
     DESC = State()
     PRICE = State()
@@ -39,9 +38,11 @@ async def admin_menu(msg: Message):
         "/finish_all – завершити ВСІ активні (зі ставками → каскад; без ставок → Купити)\n"
         "/mylots – списки Чернетки/Активні/Завершені\n"
     )
-    await msg.answer(txt)
+    # без HTML, щоб не ловити помилок парсера
+    await msg.answer(txt, parse_mode=None)
 
 
+# ─────────────── старт створення (аукціон/розпродаж)
 @admin_router.message(F.text.startswith("/createlot"))
 async def createlot_start(msg: Message, state: FSMContext):
     if msg.from_user.id not in settings.admin_id_set:
@@ -50,7 +51,7 @@ async def createlot_start(msg: Message, state: FSMContext):
     await state.set_state(CreateItemSG.DESC)
     # аукціон: крок фіксований 15
     await state.update_data(is_sale=False, min_step=15)
-    await msg.answer("Введіть опис товару (одним повідомленням)")
+    await msg.answer("Введіть опис товару (одним повідомленням).")
 
 
 @admin_router.message(F.text.startswith("/createsale"))
@@ -61,21 +62,21 @@ async def createsale_start(msg: Message, state: FSMContext):
     await state.set_state(CreateItemSG.DESC)
     # розпродаж: крок 0 (фіксована ціна, кнопка «Купити»)
     await state.update_data(is_sale=True, min_step=0)
-    await msg.answer("Введіть опис товару для розпродажу (одним повідомленням)")
+    await msg.answer("Введіть опис товару для розпродажу (одним повідомленням).")
 
 
 @admin_router.message(CreateItemSG.DESC)
 async def s_desc(msg: Message, state: FSMContext):
     await state.update_data(desc=msg.text.strip())
     await state.set_state(CreateItemSG.PRICE)
-    await msg.answer("Вкажіть ціну (ціле число)")
+    await msg.answer("Вкажіть ціну (ціле число, грн).")
 
 
 @admin_router.message(CreateItemSG.PRICE, F.text.regexp(r"^\d+$"))
 async def s_price(msg: Message, state: FSMContext):
     await state.update_data(price=int(msg.text))
     await state.set_state(CreateItemSG.QTY)
-    await msg.answer("Кількість (ціле число)")
+    await msg.answer("Кількість (ціле число ≥ 1).")
 
 
 @admin_router.message(CreateItemSG.PRICE)
@@ -95,6 +96,7 @@ async def s_qty_err(msg: Message):
     await msg.answer("Лише ціле число. Спробуйте ще раз.")
 
 
+# ─────────────── прийом фото / альбому
 @admin_router.message(CreateItemSG.PHOTOS, F.content_type == ContentType.PHOTO)
 async def s_photos(msg: Message, state: FSMContext):
     data = await state.get_data()
@@ -103,18 +105,39 @@ async def s_photos(msg: Message, state: FSMContext):
     await state.update_data(photos=photos)
 
     if msg.media_group_id is None:
+        # одиночне фото → одразу просимо підтвердження
         await state.set_state(CreateItemSG.CONFIRM)
         await msg.answer("Підтверджуємо створення? (так/ні)")
     else:
+        # альбом → залишаємося в PHOTOS, але дозволяємо завершити словом 'так'
         await msg.answer("Фото додано. Коли закінчите — напишіть 'так' для підтвердження.")
+
+
+@admin_router.message(CreateItemSG.PHOTOS, F.text.casefold().in_({"так", "yes", "y", "+"}))
+async def s_photos_confirm(msg: Message, state: FSMContext):
+    # підтвердження прямо зі стану PHOTOS (зручно для альбомів)
+    await _create_draft_from_state(msg, state)
 
 
 @admin_router.message(CreateItemSG.PHOTOS)
 async def s_photos_hint(msg: Message):
     await msg.answer("Надішліть фото (одне або альбом) або напишіть 'так' для підтвердження.")
 
-@admin_router.message(CreateItemSG.CONFIRM, F.text.casefold().in_({"так", "y", "yes", "+"}))
+
+# ─────────────── підтвердження (коли було одиночне фото)
+@admin_router.message(CreateItemSG.CONFIRM, F.text.casefold().in_({"так", "yes", "y", "+"}))
 async def s_confirm_yes(msg: Message, state: FSMContext):
+    await _create_draft_from_state(msg, state)
+
+
+@admin_router.message(CreateItemSG.CONFIRM)
+async def s_confirm_no(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Скасовано.")
+
+
+# ─────────────── хелпер: створити одну чернетку з даних FSM
+async def _create_draft_from_state(msg: Message, state: FSMContext):
     data = await state.get_data()
     desc: str = data["desc"]
     price: int = int(data["price"])
@@ -147,20 +170,21 @@ async def s_confirm_yes(msg: Message, state: FSMContext):
     await msg.answer(f"✅ Чернетка збережена. Публічний ID: <b>#{lot.public_id}</b>", parse_mode="HTML")
 
 
-@admin_router.message(CreateItemSG.CONFIRM)
-async def s_confirm_no(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer("Скасовано.")
-
-
+# ─────────────── списки
 @admin_router.message(F.text.startswith("/mylots"))
 async def mylots(msg: Message):
     if msg.from_user.id not in settings.admin_id_set:
         return
     async with async_session() as session:
-        drafts = (await session.execute(select(Lot).where(Lot.status == LotStatus.DRAFT).order_by(Lot.public_id))).scalars().all()
-        actives = (await session.execute(select(Lot).where(Lot.status == LotStatus.ACTIVE).order_by(Lot.public_id))).scalars().all()
-        fins = (await session.execute(select(Lot).where(Lot.status == LotStatus.FINISHED).order_by(Lot.public_id))).scalars().all()
+        drafts = (await session.execute(
+            select(Lot).where(Lot.status == LotStatus.DRAFT).order_by(Lot.public_id)
+        )).scalars().all()
+        actives = (await session.execute(
+            select(Lot).where(Lot.status == LotStatus.ACTIVE).order_by(Lot.public_id)
+        )).scalars().all()
+        fins = (await session.execute(
+            select(Lot).where(Lot.status == LotStatus.FINISHED).order_by(Lot.public_id)
+        )).scalars().all()
 
     def fmt(items, hint):
         if not items:
@@ -175,7 +199,7 @@ async def mylots(msg: Message):
     await msg.answer(txt)
 
 
-# ─────────────── Публікація одного лота
+# ─────────────── публікація одного лота
 async def _publish_lot(pub_id: int, bot: Bot):
     async with async_session() as session:
         stmt = select(Lot).options(selectinload(Lot.photos)).where(Lot.public_id == pub_id)
@@ -188,7 +212,7 @@ async def _publish_lot(pub_id: int, bot: Bot):
         link_text = "Купити" if is_sale else "Бронь"
         deeplink = f"https://t.me/{me.username}?start={'sale' if is_sale else 'lot'}_{lot.public_id}"
 
-        step_line = "" if is_sale else "Крок: 15 грн\n"   # <-- окремим рядком, без f-виразу
+        step_line = "" if is_sale else "Крок: 15 грн\n"
 
         caption = (
             f"<b>{lot.title}</b>\n\n"
@@ -198,8 +222,6 @@ async def _publish_lot(pub_id: int, bot: Bot):
             f"ID лота — #{lot.public_id}"
         )
 
-
-        # постимо у канал
         if lot.photos:
             if len(lot.photos) == 1:
                 m = await bot.send_photo(settings.CHANNEL_ID, photo=lot.photos[0].file_id, caption=caption)
@@ -234,24 +256,25 @@ async def publish(msg: Message, bot: Bot):
     await msg.answer("Опубліковано" if ok else "Лот не знайдено або не в Чернетках")
 
 
+# ─────────────── публікація всіх чернеток
 @admin_router.message(F.text == "/publish_all")
 async def publish_all(msg: Message, bot: Bot):
     if msg.from_user.id not in settings.admin_id_set:
         return
     async with async_session() as session:
-        drafts = (await session.execute(select(Lot).where(Lot.status == LotStatus.DRAFT).order_by(Lot.public_id))).scalars().all()
+        drafts = (await session.execute(
+            select(Lot).where(Lot.status == LotStatus.DRAFT).order_by(Lot.public_id)
+        )).scalars().all()
     if not drafts:
-        await msg.answer("Чернеток немає")
+        await msg.answer("Чернеток немає.")
         return
     for d in drafts:
         await _publish_lot(d.public_id, bot)
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.25)  # повага до лімітів TG
     await msg.answer("Готово: усі чернетки опубліковані.")
 
 
-# ─────────────── Завершення: один / усі
-from app.services.cascade import start_cascade
-
+# ─────────────── завершення: один / усі
 @admin_router.message(F.text.startswith("/finish "))
 async def finish(msg: Message, bot: Bot):
     if msg.from_user.id not in settings.admin_id_set:
@@ -264,7 +287,7 @@ async def finish(msg: Message, bot: Bot):
     async with async_session() as session:
         lot = (await session.execute(select(Lot).where(Lot.public_id == pub_id))).scalar_one_or_none()
         if not lot:
-            await msg.answer("Лот не знайдено")
+            await msg.answer("Лот не знайдено.")
             return
     await start_cascade(bot, lot.id)
     await msg.answer("Каскад запущено.")
@@ -281,7 +304,7 @@ async def finish_all(msg: Message, bot: Bot):
         )).scalars().all()
 
     if not actives:
-        await msg.answer("Активних немає")
+        await msg.answer("Активних немає.")
         return
 
     me = await bot.get_me()
@@ -291,7 +314,9 @@ async def finish_all(msg: Message, bot: Bot):
     for lot in actives:
         # чи були ставки?
         async with async_session() as session:
-            cnt = (await session.execute(select(func.count()).select_from(Bid).where(Bid.lot_id == lot.id))).scalar_one()
+            cnt = (await session.execute(
+                select(func.count()).select_from(Bid).where(Bid.lot_id == lot.id)
+            )).scalar_one()
         if cnt > 0 and lot.min_step > 0:
             await start_cascade(bot, lot.id)
             cascaded += 1
