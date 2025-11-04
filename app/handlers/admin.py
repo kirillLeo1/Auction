@@ -22,7 +22,6 @@ class CreateItemSG(StatesGroup):
     PRICE = State()
     QTY = State()
     PHOTOS = State()
-    BATCH = State()
     CONFIRM = State()
 
 
@@ -88,7 +87,7 @@ async def s_price_err(msg: Message):
 async def s_qty(msg: Message, state: FSMContext):
     await state.update_data(qty=int(msg.text))
     await state.set_state(CreateItemSG.PHOTOS)
-    await msg.answer("Надішліть фото (одне або альбом). Коли закінчите — напишіть кількість чернеток (1..n).")
+    await msg.answer("Надішліть фото (одне або альбом). Коли закінчите — напишіть 'так' для підтвердження.")
 
 
 @admin_router.message(CreateItemSG.QTY)
@@ -104,28 +103,15 @@ async def s_photos(msg: Message, state: FSMContext):
     await state.update_data(photos=photos)
 
     if msg.media_group_id is None:
-        await state.set_state(CreateItemSG.BATCH)
-        await msg.answer("Скільки однакових чернеток створити? (напр. 1 або 200)")
+        await state.set_state(CreateItemSG.CONFIRM)
+        await msg.answer("Підтверджуємо створення? (так/ні)")
     else:
-        await msg.answer("Фото додано. Коли закінчите — напишіть кількість чернеток (1..n)")
+        await msg.answer("Фото додано. Коли закінчите — напишіть 'так' для підтвердження.")
 
 
 @admin_router.message(CreateItemSG.PHOTOS)
 async def s_photos_hint(msg: Message):
-    await msg.answer("Надішліть фото або напишіть кількість чернеток (1..n).")
-
-
-@admin_router.message(CreateItemSG.BATCH, F.text.regexp(r"^\d+$"))
-async def s_batch(msg: Message, state: FSMContext):
-    await state.update_data(batch=int(msg.text))
-    await state.set_state(CreateItemSG.CONFIRM)
-    await msg.answer("Підтверджуємо створення? (так/ні)")
-
-
-@admin_router.message(CreateItemSG.BATCH)
-async def s_batch_err(msg: Message):
-    await msg.answer("Лише ціле число. Спробуйте ще раз.")
-
+    await msg.answer("Надішліть фото (одне або альбом) або напишіть 'так' для підтвердження.")
 
 @admin_router.message(CreateItemSG.CONFIRM, F.text.casefold().in_({"так", "y", "yes", "+"}))
 async def s_confirm_yes(msg: Message, state: FSMContext):
@@ -133,36 +119,32 @@ async def s_confirm_yes(msg: Message, state: FSMContext):
     desc: str = data["desc"]
     price: int = int(data["price"])
     qty: int = int(data["qty"])
-    min_step: int = int(data["min_step"])   # 15 — auction; 0 — sale
-    batch: int = int(data.get("batch", 1))
+    min_step: int = int(data["min_step"])   # 15 для аукціону, 0 для розпродажу
     photos: list[str] = data.get("photos", [])
 
-    created_ids: list[int] = []
     async with async_session() as session:
         last_pub = (await session.execute(select(func.max(Lot.public_id)))).scalar() or 0
-        for i in range(batch):
-            lot = Lot(
-                public_id=last_pub + 1 + i,
-                title=desc,
-                condition="",
-                size="",
-                start_price=price,
-                min_step=min_step,
-                quantity=qty,
-                status=LotStatus.DRAFT,
-                current_price=price,
-                created_by=msg.from_user.id,
-                channel_id=settings.CHANNEL_ID,
-            )
-            session.add(lot)
-            await session.flush()
-            for fid in photos:
-                session.add(LotPhoto(lot_id=lot.id, file_id=fid))
-            created_ids.append(lot.public_id)
+        lot = Lot(
+            public_id=last_pub + 1,
+            title=desc,
+            condition="",
+            size="",
+            start_price=price,
+            min_step=min_step,
+            quantity=qty,
+            status=LotStatus.DRAFT,
+            current_price=price,
+            created_by=msg.from_user.id,
+            channel_id=settings.CHANNEL_ID,
+        )
+        session.add(lot)
+        await session.flush()
+        for fid in photos:
+            session.add(LotPhoto(lot_id=lot.id, file_id=fid))
         await session.commit()
 
     await state.clear()
-    await msg.answer("Створено чернеток: " + ", ".join(f"#{p}" for p in created_ids))
+    await msg.answer(f"✅ Чернетка збережена. Публічний ID: <b>#{lot.public_id}</b>", parse_mode="HTML")
 
 
 @admin_router.message(CreateItemSG.CONFIRM)
