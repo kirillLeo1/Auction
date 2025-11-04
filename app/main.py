@@ -54,77 +54,90 @@ async def health():
 # Єдина реалізація логіки вебхука (працює і для /monopay/webhook,
 # і для /telegram/webhook/monopay/webhook як "страховка")
 async def _handle_monopay_webhook(request: Request) -> str:
+    from datetime import datetime  # локальний імпорт, щоб не чіпати верхи
+
     raw = await request.body()
     x_sign = request.headers.get("X-Sign")
 
+    # 0) Перевірка криптопідпису MonoPay (обовʼязково для продакшену)
     if not x_sign or not await verify_webhook_signature(raw, x_sign):
         raise HTTPException(400, "Bad signature")
 
-    offer_id = int(request.query_params.get("offer_id", "0"))
+    # Параметри
+    offer_id = int(request.query_params.get("offer_id", "0") or 0)
     data = await request.json()
-    status = data.get("status")        # created / processing / success / failure
+    status = data.get("status")            # created / processing / success / failure
     invoice_id = data.get("invoiceId")
+    amount = int(data.get("amount", 0) or 0)  # у копійках
+    ccy = int(data.get("ccy", 980) or 980)    # 980 = UAH
 
     async with async_session() as session:
         off = await session.get(Offer, offer_id)
         if not off:
+            # незнайома пропозиція — ігноруємо тихо
             return "ok"
 
-        # якщо Mono прислала іншу invoiceId — ігноруємо
+        # 1) Ідемпотентність: якщо вже оплачене — нічого не робимо
+        if off.status == OfferStatus.PAID:
+            return "ok"
+
+        # 2) invoiceId має збігатися з тим, що ми створили
         if off.invoice_id and invoice_id and off.invoice_id != invoice_id:
             return "ok"
 
-        if status == "success":
-            off.status = OfferStatus.PAID
-            from datetime import datetime
-            off.paid_at = datetime.utcnow()
-            await session.flush()
+        # 3) Валюта й сума мають збігатися (UAH і рівно offered_price * 100 коп.)
+        if ccy != 980 or amount != off.offered_price * 100:
+            return "ok"
 
-            lot = await session.get(Lot, off.lot_id)
+        # 4) Тільки 'success' зараховуємо як оплату
+        if status != "success":
+            return "ok"
 
-            # якщо товарів більше нема — скасовуємо інші броні і видаляємо пост з каналу
-            paid_cnt = (await session.execute(
-                select(_func.count()).select_from(Offer)
-                .where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID)
-            )).scalar_one()
+        # ==== Все ок: фіксуємо оплату ====
+        off.status = OfferStatus.PAID
+        off.paid_at = datetime.utcnow()
+        await session.flush()
 
-            if paid_cnt >= lot.quantity:
-                others = (await session.execute(
-                    select(Offer).where(
-                        Offer.lot_id == lot.id,
-                        Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])
-                    )
-                )).scalars().all()
-                for o in others:
-                    o.status = OfferStatus.CANCELED
-                if lot.channel_id and lot.channel_message_id:
-                    try:
-                        await bot.delete_message(lot.channel_id, lot.channel_message_id)
-                    except Exception:
-                        pass
+        # Якщо кількість вичерпана — скасовуємо інші активні офери і видаляємо пост
+        lot = await session.get(Lot, off.lot_id)
+        paid_cnt = (await session.execute(
+            select(_func.count()).select_from(Offer)
+            .where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID)
+        )).scalar_one()
 
-            # БЕЗ ЖОДНИХ ДІПЛІНКІВ: ставимо користувачу стан одношагової форми
-            me = await bot.get_me()
-            key = StorageKey(
-                chat_id=off.user_tg_id,
-                user_id=off.user_tg_id,
-                bot_id=me.id,
-            )
-            await dp.fsm.storage.set_state(key, ContactOneSG.ONE)
-            await dp.fsm.storage.set_data(key, {"offer_id": off.id})
+        if paid_cnt >= lot.quantity:
+            others = (await session.execute(
+                select(Offer).where(
+                    Offer.lot_id == lot.id,
+                    Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])
+                )
+            )).scalars().all()
+            for o in others:
+                o.status = OfferStatus.CANCELED
+            if lot.channel_id and lot.channel_message_id:
+                try:
+                    await bot.delete_message(lot.channel_id, lot.channel_message_id)
+                except Exception:
+                    pass
 
-            # просимо ввести дані одним повідомленням
-            prompt = (
-                "✅ Оплату зараховано!\n\n"
-                "Введіть, будь ласка, ОДНИМ повідомленням:\n"
-                "ПІБ / місто / відділення (або адреса) / телефон\n\n"
-                "Приклад:\n"
-                "Іван Іванов\nКиїв\nНП Відділення 12\n+380XXXXXXXXX"
-            )
-            try:
-                await bot.send_message(off.user_tg_id, prompt)
-            except Exception:
-                pass
+        # Без жодних диплінків — прямо просимо дані одним повідомленням,
+        # та ставимо користувачу FSM-стан ContactOneSG.ONE
+        me = await bot.get_me()
+        key = StorageKey(chat_id=off.user_tg_id, user_id=off.user_tg_id, bot_id=me.id)
+        await dp.fsm.storage.set_state(key, ContactOneSG.ONE)
+        await dp.fsm.storage.set_data(key, {"offer_id": off.id})
+
+        prompt = (
+            "✅ Оплату зараховано!\n\n"
+            "Введіть ОДНИМ повідомленням:\n"
+            "ПІБ / місто / відділення (або адреса) / телефон\n\n"
+            "Приклад:\n"
+            "Іван Іванов\nКиїв\nНП Відділення 12\n+380XXXXXXXXX"
+        )
+        try:
+            await bot.send_message(off.user_tg_id, prompt)
+        except Exception:
+            pass
 
         await session.commit()
 
