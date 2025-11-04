@@ -13,8 +13,9 @@ from app.handlers.user import user_router
 from app.services.cascade import advance_cascade
 from app.models import Offer, OfferStatus, Lot
 from app.services.monopay import verify_webhook_signature
+from aiogram.client.default import DefaultBotProperties
 
-bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(admin_router)
 dp.include_router(user_router)
