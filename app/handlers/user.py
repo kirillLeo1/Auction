@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, func, desc
@@ -287,36 +287,81 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
             await msg.answer("Посилання застаріло. Спробуйте ще раз /start")
             await state.clear()
             return
-        # Приймаємо будь-яке повідомлення як «дані покупця»
+
+        # Приймаємо будь-який текст як «дані покупця»
         off.contact_comment = msg.text
         await session.flush()
-        lot = await session.get(Lot, off.lot_id)
+
+        # Забираємо лот разом із фото
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        lot = (
+            await session.execute(
+                select(Lot)
+                .options(selectinload(Lot.photos))
+                .where(Lot.id == off.lot_id)
+            )
+        ).scalar_one()
+
         await session.commit()
 
-    # Надсилаємо карточку в менеджерський чат (або адмінам, якщо чат не задано)
     tag = "Оплачено" if off.status == OfferStatus.PAID else "Відкладено"
-    user_link = (
-        f"@{msg.from_user.username}" if msg.from_user.username else str(msg.from_user.id)
+    user_link = f"@{msg.from_user.username}" if msg.from_user.username else f"id:{msg.from_user.id}"
+
+    # Підпис для першого фото/повідомлення (влізає в ліміт caption)
+    base_caption = (
+        f"<b>{lot.title}</b>\n"
+        f"ID лота — #{lot.public_id}\n"
+        f"Ціна: <b>{off.offered_price} грн</b>\n"
+        f"Статус: <b>{tag}</b>\n\n"
+        f"<u>Заявка від {user_link}:</u>\n{msg.text}"
     )
-    card = (
-        f"{tag} | Лот #{lot.public_id} | Юзер {user_link}\n"
-        f"Сума: {off.offered_price} грн\n"
-        f"Дані покупця:\n{msg.text}"
-    )
+    # Телеграм ліміт підпису ~1024 символи — підріжемо, якщо що
+    if len(base_caption) > 1024:
+        base_caption = base_caption[:1021] + "..."
 
     sent = False
-    if settings.MANAGER_CHAT_ID:
-        try:
-            await bot.send_message(settings.MANAGER_CHAT_ID, card)
+    target_chat = settings.MANAGER_CHAT_ID or 0
+
+    try:
+        if target_chat:
+            # Є фото → шлемо фото/медіагрупу з підписом до першого кадра
+            if lot.photos:
+                if len(lot.photos) == 1:
+                    await bot.send_photo(
+                        chat_id=target_chat,
+                        photo=lot.photos[0].file_id,
+                        caption=base_caption,
+                        parse_mode="HTML",
+                    )
+                else:
+                    media = [InputMediaPhoto(media=p.file_id) for p in lot.photos]
+                    media[0].caption = base_caption
+                    media[0].parse_mode = "HTML"
+                    await bot.send_media_group(chat_id=target_chat, media=media)
+            else:
+                # без фото — просто текст
+                await bot.send_message(chat_id=target_chat, text=base_caption, parse_mode="HTML")
             sent = True
-        except Exception:
-            sent = False
+    except Exception:
+        sent = False
+
+    # Фолбек: якщо менеджерський чат не заданий/недоступний — розсилаємо адмінам
     if not sent:
         for adm in settings.admin_id_set:
             try:
-                await bot.send_message(adm, card)
+                if lot.photos:
+                    if len(lot.photos) == 1:
+                        await bot.send_photo(adm, lot.photos[0].file_id, caption=base_caption, parse_mode="HTML")
+                    else:
+                        media = [InputMediaPhoto(media=p.file_id) for p in lot.photos]
+                        media[0].caption = base_caption
+                        media[0].parse_mode = "HTML"
+                        await bot.send_media_group(adm, media)
+                else:
+                    await bot.send_message(adm, base_caption, parse_mode="HTML")
             except Exception:
                 pass
 
-    await msg.answer("Дякуємо! Дані отримано. Менеджер скоро зв’яжеться.")
+    await msg.answer("Дякуємо! Дані отримано. Менеджер вже бачить ваш лот і заявку.")
     await state.clear()
