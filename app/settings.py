@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     MONOPAY_REDIRECT_URL: str
     HOLD_HOURS: int = 24  # 24 години очікування оплати
     TZ: str = "Europe/Kyiv"
-    # Чат менеджера, куди летять замовлення (оплачені/відкладені)
+    MONOPAY_SKIP_SIGNATURE: bool = False
     MANAGER_CHAT_ID: int = 0
 
     @computed_field
