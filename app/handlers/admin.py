@@ -257,7 +257,7 @@ async def publish(msg: Message, bot: Bot):
 
 
 # ─────────────── публікація всіх чернеток
-@admin_router.message(F.text == "/publish_all")
+@admin_router.message(F.text == "/allpub")
 async def publish_all(msg: Message, bot: Bot):
     if msg.from_user.id not in settings.admin_id_set:
         return
@@ -293,7 +293,7 @@ async def finish(msg: Message, bot: Bot):
     await msg.answer("Каскад запущено.")
 
 
-@admin_router.message(F.text == "/finish_all")
+@admin_router.message(F.text == "/finall")
 async def finish_all(msg: Message, bot: Bot):
     if msg.from_user.id not in settings.admin_id_set:
         return
