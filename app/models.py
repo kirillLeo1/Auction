@@ -82,7 +82,7 @@ class Offer(Base):
     invoice_id: Mapped[str | None] = mapped_column(String(64), index=True)
     invoice_url: Mapped[str | None] = mapped_column(String(256))
     paid_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # one-shot форма контактів (Part 2 буде збереження)
+    reminder_sent: Mapped[bool] = mapped_column(Boolean, default=False)   
     contact_fullname: Mapped[str | None] = mapped_column(String(200))
     contact_phone: Mapped[str | None] = mapped_column(String(64))
     contact_city_region: Mapped[str | None] = mapped_column(String(200))
