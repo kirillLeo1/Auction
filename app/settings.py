@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     MANAGER_CHAT_ID: int = 0
     MONOPAY_PUBKEY: str | None = None
     DEFAULT_MIN_STEP: int = 15
+    MONOPAY_DEBUG: bool = False
 
     @computed_field
     @property
