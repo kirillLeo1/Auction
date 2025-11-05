@@ -7,9 +7,10 @@ import httpx
 from app.settings import settings
 
 # crypto
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization as ser
 
 MONO_API = "https://api.monobank.ua"
 
@@ -23,20 +24,20 @@ def _dbg(msg: str) -> None:
 
 def _b64decode_loose(s: str) -> bytes:
     """
-    Base64/urlsafe Base64 з автопаддінгом.
-    Не падає на відсутніх '=' і пробілах/переносах.
+    Безпечний декодер: прибирає пробіли/переноси, додає паддинг,
+    підтримує urlsafe алфавіт (-, _).
     """
-    t = (s or "").strip().replace("\n", "").replace("\r", "")
-    for func in (base64.b64decode, base64.urlsafe_b64decode):
-        cur = t
-        pad = (-len(cur)) % 4
-        if pad:
-            cur += "=" * pad
-        try:
-            return func(cur)
-        except Exception:
-            continue
-    raise ValueError("bad base64")
+    if not isinstance(s, str):
+        s = s.decode("utf-8", "ignore")
+    s = s.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    # urlsafe декодування + автопаддинг
+    pad = (-len(s)) % 4
+    s = s + ("=" * pad)
+    try:
+        return base64.urlsafe_b64decode(s.encode("ascii"))
+    except Exception as e:
+        logging.info("MONOPAY DEBUG: b64decode failed: %s | head=%s...", repr(e), s[:16])
+        raise
 
 
 async def _get_pubkey_bytes() -> bytes:
@@ -123,33 +124,54 @@ async def create_invoice(amount_uah: int, reference: str, destination: str, comm
 
 async def verify_webhook_signature(raw_body: bytes, x_sign: str) -> bool:
     """
-    Перевірка X-Sign (ECDSA P-256 + SHA-256) по сирому body.
-    Повертає True/False без виключень (щоб вебхук завжди відповідав 200/400 у handler’і).
+    Перевірка підпису MonoPay Webhook:
+    - публічний ключ: з ENV MONOPAY_PUBKEY (PEM або base64 DER) або з /api/merchant/pubkey по X-Token
+    - підпис: DER-encoded ECDSA, приходить у заголовку X-Sign (base64/urlsafe)
     """
-    if str(getattr(settings, "MONOPAY_SKIP_SIGNATURE", "")).lower() in {"1", "true", "yes"}:
-        _dbg("verify_webhook_signature: SKIPPED by MONOPAY_SKIP_SIGNATURE")
-        return True
+    # 1) Публічний ключ
+    pub_src = "API"
+    pub_der: bytes | None = None
 
+    # Якщо в ENV задано MONOPAY_PUBKEY — приймаємо і PEM, і base64 DER
+    from app.settings import settings
+    if getattr(settings, "MONOPAY_PUBKEY", None):
+        s = settings.MONOPAY_PUBKEY.strip()
+        pub_src = "ENV"
+        if "BEGIN PUBLIC KEY" in s:       # PEM
+            pub_key = ser.load_pem_public_key(s.encode("utf-8"))
+        else:                              # base64 DER
+            pub_der = _b64decode_loose(s)
+            pub_key = ser.load_der_public_key(pub_der)
+    else:
+        # Інакше беремо з API по X-Token
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://api.monobank.ua/api/merchant/pubkey",
+                headers={"X-Token": settings.MONOPAY_TOKEN},
+            )
+            r.raise_for_status()
+            # API повертає b64-рядок у лапках
+            der_b64 = r.text.strip().strip('"')
+            pub_der = _b64decode_loose(der_b64)
+            pub_key = ser.load_der_public_key(pub_der)
+
+    # 2) Декодуємо X-Sign «поблажливо»
     try:
-        # X-Sign може прийти без '=' або urlsafe — декодуємо ліберально
         sig = _b64decode_loose(x_sign)
     except Exception as e:
-        _dbg(f"verify_webhook_signature: bad x_sign base64 ({type(e).__name__}: {e})")
+        logging.info("app.monopay:MONOPAY DEBUG: bad base64 in X-Sign: %r", e)
         return False
 
+    # 3) Перевіряємо ECDSA(SHA256)
     try:
-        pub_bytes = await _get_pubkey_bytes()
-        pub = _load_pubkey_object(pub_bytes)
-
-        body_sha = hashlib.sha256(raw_body).hexdigest()
-        _dbg(f"verify_webhook_signature=True? x_sign_len={len(x_sign)} body_sha256={body_sha}")
-
-        pub.verify(sig, raw_body, ec.ECDSA(hashes.SHA256()))
+        pub_key.verify(sig, raw_body, ec.ECDSA(hashes.SHA256()))
+        logging.info("app.monopay:MONOPAY DEBUG: verify_webhook_signature=True (pubkey_source=%s, x_sign_len=%d)",
+                     pub_src, len(x_sign))
         return True
     except InvalidSignature:
-        _dbg("verify_webhook_signature: InvalidSignature")
+        logging.info("app.monopay:MONOPAY DEBUG: verify_webhook_signature=False (InvalidSignature)")
         return False
     except Exception as e:
-        _dbg(f"verify_webhook_signature: exception={type(e).__name__}: {e}")
+        logging.info("app.monopay:MONOPAY DEBUG: verify_webhook_signature: exception=%s", repr(e))
         return False
 
