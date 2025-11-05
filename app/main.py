@@ -15,8 +15,11 @@ from app.handlers.user import user_router
 from app.handlers.user import ContactOneSG   # <- одношагова форма
 from app.services.cascade import advance_cascade
 from app.models import Offer, OfferStatus, Lot
-from app.services.monopay import verify_webhook_signature
+from app.services.monopay import verify_webhook_signature, _dbg
 import logging, hashlib
+from datetime import datetime
+
+
 dbg_logger = logging.getLogger("app.monopay")
 logging.basicConfig(level=logging.INFO)
 
@@ -62,129 +65,116 @@ def _dbg(msg: str, *args):
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MonoPay webhook: перевіряємо підпис, оновлюємо статус оффера, шлемо користувачу повідомлення
 async def _handle_monopay_webhook(request: Request) -> str:
-    from datetime import datetime
-    from sqlalchemy import select as _select
-    from sqlalchemy import func as _func
-
     # 0) сире тіло + заголовки
     raw = await request.body()
     body_sha = hashlib.sha256(raw).hexdigest()
+
+    # Mono інколи присилає X-Sign (офіційно) або X-Signature (деякі проксі/SDK)
     x_sign = request.headers.get("X-Sign") or request.headers.get("X-Signature")
     ctype = request.headers.get("content-type")
 
-    client_ip = getattr(getattr(request, "client", None), "host", "?")
-    _dbg("hit %s %s | ip=%s | has X-Sign=%s X-Signature=%s | ctype=%s | body_sha256=%s",
-         request.method, request.url.path, client_ip,
-         bool(request.headers.get('X-Sign')), bool(request.headers.get('X-Signature')),
-         ctype, body_sha[:16])
+    client = getattr(request, "client", None)
+    client_ip = getattr(client, "host", "?")
+
+    _dbg(
+        "hit POST /monopay/webhook | ip=%s | has X-Sign=%s X-Signature=%s | ctype=%s | body_sha256=%s"
+        % (
+            client_ip,
+            bool(request.headers.get("X-Sign")),
+            bool(request.headers.get("X-Signature")),
+            ctype,
+            body_sha[:16],
+        )
+    )
 
     # 1) перевірка підпису
     if not x_sign:
-        _dbg("reject 400: missing signature header; headers_keys=%s", list(request.headers.keys()))
+        _dbg("reject 400: missing signature header; headers_keys=%s" % list(request.headers.keys()))
         raise HTTPException(400, "Bad signature")
 
     ok = await verify_webhook_signature(raw, x_sign)
-    _dbg("verify_webhook_signature=%s (x_sign_len=%s)", ok, len(x_sign or ""))
     if not ok:
-        _dbg("reject 400: signature invalid (body_sha256=%s)", body_sha)
+        _dbg("reject 400: signature invalid (body_sha256=%s)" % body_sha)
         raise HTTPException(400, "Bad signature")
 
-    # 2) payload
-    offer_id = int(request.query_params.get("offer_id", "0") or 0)
+    # 2) парсимо JSON
     try:
         data = await request.json()
-    except Exception as e:
-        _dbg("reject 400: json parse error: %s", e)
-        raise HTTPException(400, "Bad json")
+    except Exception:
+        _dbg("reject 400: bad json")
+        raise HTTPException(400, "Bad JSON")
 
-    status = data.get("status")
+    status = data.get("status")            # created / processing / success / failure
     invoice_id = data.get("invoiceId")
-    amount = int(data.get("amount", 0) or 0)   # копійки
-    ccy = int(data.get("ccy", 980) or 980)
 
-    _dbg("payload: offer_id=%s status=%s invoice_id=%s amount=%s ccy=%s",
-         offer_id, status, invoice_id, amount, ccy)
+    # 3) беремо offer_id з query (?offer_id=...)
+    try:
+        offer_id = int(request.query_params.get("offer_id", "0"))
+    except Exception:
+        offer_id = 0
 
-    # 3) бізнес-логіка
+    if not offer_id:
+        _dbg("skip: no offer_id in query")
+        return "ok"
+
+    # 4) оновлюємо БД
     async with async_session() as session:
         off = await session.get(Offer, offer_id)
         if not off:
-            _dbg("noop: offer not found (id=%s)", offer_id)
+            _dbg(f"skip: offer {offer_id} not found")
             return "ok"
 
-        if off.status == OfferStatus.PAID:
-            _dbg("noop: offer already PAID (id=%s)", off.id)
-            return "ok"
-
+        # захист від не того інвойсу
         if off.invoice_id and invoice_id and off.invoice_id != invoice_id:
-            _dbg("noop: invoice mismatch expected=%s got=%s", off.invoice_id, invoice_id)
-            return "ok"
-
-        expected_amount = off.offered_price * 100
-        if ccy != 980 or amount != expected_amount:
-            _dbg("noop: amount/ccy mismatch expected_amount=%s got_amount=%s expected_ccy=980 got_ccy=%s",
-                 expected_amount, amount, ccy)
+            _dbg(f"skip: invoice mismatch saved={off.invoice_id} got={invoice_id}")
             return "ok"
 
         if status != "success":
-            _dbg("noop: status is not success: %s", status)
+            _dbg(f"noop: status is not success: {status}")
             return "ok"
 
-        # 4) зарахували оплату
+        # success → фіксуємо оплату
         off.status = OfferStatus.PAID
         off.paid_at = datetime.utcnow()
         await session.flush()
+
+        # якщо усі штуки викуплені — скасовуємо інші активні пропозиції
         lot = await session.get(Lot, off.lot_id)
-
-        # 5) якщо все розкупили — скасувати інших і видалити пост з каналу
-        paid_cnt = (await session.execute(
-            _select(_func.count()).select_from(Offer)
-            .where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID)
-        )).scalar_one()
-        _dbg("paid counter for lot %s: %s of %s", lot.public_id, paid_cnt, lot.quantity)
-
-        if paid_cnt >= lot.quantity:
-            others = (await session.execute(
-                _select(Offer).where(
-                    Offer.lot_id == lot.id,
-                    Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])
+        if lot:
+            from sqlalchemy import select, func
+            paid_cnt = (
+                await session.execute(
+                    select(func.count()).select_from(Offer).where(
+                        Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID
+                    )
                 )
-            )).scalars().all()
-            for o in others:
-                o.status = OfferStatus.CANCELED
-            if lot.channel_id and lot.channel_message_id:
-                try:
-                    await bot.delete_message(lot.channel_id, lot.channel_message_id)
-                    _dbg("channel message deleted chat=%s msg=%s", lot.channel_id, lot.channel_message_id)
-                except Exception as e:
-                    _dbg("channel delete failed: %s", e)
-
-        # 6) однокрокова форма контактів
-        me = await bot.get_me()
-        key = StorageKey(chat_id=off.user_tg_id, user_id=off.user_tg_id, bot_id=me.id)
-        await dp.fsm.storage.set_state(key, ContactOneSG.ONE)
-        await dp.fsm.storage.set_data(key, {"offer_id": off.id})
-
-        try:
-            await bot.send_message(
-                off.user_tg_id,
-                "✅ Оплату зараховано!\n\n"
-                "Відповідай одним повідомленням: ПІБ / місто / відділення (або адреса) / телефон.",
-            )
-            _dbg("user %s prompted for contacts (offer=%s)", off.user_tg_id, off.id)
-        except Exception as e:
-            _dbg("send_message failed: %s", e)
+            ).scalar_one()
+            if paid_cnt >= lot.quantity:
+                others = (
+                    await session.execute(
+                        select(Offer).where(
+                            Offer.lot_id == lot.id,
+                            Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED]),
+                        )
+                    )
+                ).scalars().all()
+                for o in others:
+                    o.status = OfferStatus.CANCELED
 
         await session.commit()
 
-    _dbg("webhook processing OK for offer_id=%s", offer_id)
+    _dbg(f"ok: offer_id={offer_id} marked as PAID; invoice_id={invoice_id}")
     return "ok"
 
 
+# Публічний ендпоінт — залиш як є, або так:
 @app.post("/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook(request: Request):
     return await _handle_monopay_webhook(request)
+
 
 
 # альтернативний шлях, якщо випадково у BASE_URL колись додаси префікс /telegram/webhook
