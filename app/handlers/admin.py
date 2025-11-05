@@ -48,7 +48,7 @@ async def createlot_start(msg: Message, state: FSMContext):
         return
     await state.clear()
     await state.set_state(CreateItemSG.DESC)
-    await state.update_data(is_sale=False, min_step=15)  # аукціон
+    await state.update_data(is_sale=False, min_step=settings.DEFAULT_MIN_STEP)  # аукціон
     await msg.answer("Введіть опис товару (одним повідомленням).")
 
 @admin_router.message(F.text.startswith("/createsale"))
