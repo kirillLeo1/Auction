@@ -24,19 +24,26 @@ def _dbg(msg: str) -> None:
 
 def _b64decode_loose(s: str) -> bytes:
     """
-    Безпечний декодер: прибирає пробіли/переноси, додає паддинг,
-    підтримує urlsafe алфавіт (-, _).
+    Максимально толерантний декод Base64:
+    - прибирає пробіли/переноси
+    - уніфікує алфавіт (перетворює urlsafe на стандартний)
+    - додає паддінг '='
+    - декодує без strict-валидації
     """
-    if not isinstance(s, str):
+    if isinstance(s, bytes):
         s = s.decode("utf-8", "ignore")
-    s = s.strip().replace("\n", "").replace("\r", "").replace(" ", "")
-    # urlsafe декодування + автопаддинг
-    pad = (-len(s)) % 4
-    s = s + ("=" * pad)
+    # прибрати всі whitespace
+    s = "".join(s.split())
+    # привести urlsafe до стандартного алфавіту
+    s = s.replace("-", "+").replace("_", "/")
+    # додати '=' до кратності 4
+    missing = (-len(s)) % 4
+    if missing:
+        s += "=" * missing
     try:
-        return base64.urlsafe_b64decode(s.encode("ascii"))
+        return base64.b64decode(s, validate=False)
     except Exception as e:
-        logging.info("MONOPAY DEBUG: b64decode failed: %s | head=%s...", repr(e), s[:16])
+        logging.info("MONOPAY DEBUG: b64decode(loose) failed: %r | head=%s...", e, s[:20])
         raise
 
 
