@@ -4,7 +4,10 @@ from typing import Tuple
 from app.settings import settings
 
 MONO_API = "https://api.monobank.ua"
-_PUBKEY_CACHE: Tuple[str, bytes] | None = None  # ("der"|"pem", data)
+# офіційний endpoint з доки checkout/webhooks:
+PUBKEY_URL = f"{MONO_API}/personal/checkout/signature/public/key"
+
+_PUBKEY_CACHE: bytes | None = None
 
 
 def _b64decode_loose(s: str) -> bytes:
@@ -22,66 +25,25 @@ def _b64decode_loose(s: str) -> bytes:
     raise ValueError("bad base64")
 
 
-async def get_pubkey(client: httpx.AsyncClient) -> Tuple[str, bytes]:
+async def _get_pubkey() -> bytes:
     """
-    Повертає ("der"/"pem", bytes). Порядок:
-    1) Якщо MONOPAY_PUBKEY у .env — використовуємо його (DER base64 або PEM).
-    2) Інакше тягнемо з API /api/merchant/pubkey (X-Token).
+    1) Якщо в .env задано MONOPAY_PUBKEY (DER/base64) — беремо його.
+    2) Інакше тягнемо через офіційний endpoint (DER/base64) і кешуємо.
     """
     global _PUBKEY_CACHE
+    if settings.__dict__.get("MONOPAY_PUBKEY"):
+        # у .env зберігаємо ПУБЛІЧНИЙ ключ у base64 (DER)
+        return base64.b64decode(settings.MONOPAY_PUBKEY)
+
     if _PUBKEY_CACHE:
         return _PUBKEY_CACHE
 
-    # 1) override з .env
-    if settings.MONOPAY_PUBKEY:
-        val = settings.MONOPAY_PUBKEY.strip()
-        try:
-            if val.startswith("-----BEGIN"):
-                _PUBKEY_CACHE = ("pem", val.encode())
-            else:
-                der = _b64decode_loose(val)
-                _PUBKEY_CACHE = ("der", der)
-            return _PUBKEY_CACHE
-        except Exception:
-            # впаде -> спробуємо API
-            pass
-
-    # 2) тягнемо з API Mono
-    r = await client.get(
-        f"{MONO_API}/api/merchant/pubkey",
-        headers={"X-Token": settings.MONOPAY_TOKEN},
-        timeout=15,
-    )
-    r.raise_for_status()
-    ct = r.headers.get("content-type", "")
-    body_text = r.text.strip()
-
-    b64 = None
-    if "application/json" in ct:
-        try:
-            j = r.json()
-            if isinstance(j, str):
-                b64 = j
-            elif isinstance(j, dict):
-                b64 = j.get("key") or j.get("pubkey") or j.get("data")
-        except Exception:
-            b64 = body_text.strip('"')
-    else:
-        if body_text.startswith('"') and body_text.endswith('"'):
-            b64 = body_text[1:-1]
-        else:
-            b64 = body_text
-
-    if b64:
-        try:
-            der = _b64decode_loose(b64)
-            _PUBKEY_CACHE = ("der", der)
-            return _PUBKEY_CACHE
-        except Exception:
-            pass
-
-    _PUBKEY_CACHE = ("pem", r.content)
-    return _PUBKEY_CACHE
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(PUBKEY_URL, headers={"X-Token": settings.MONOPAY_TOKEN})
+        r.raise_for_status()
+        der_b64 = r.text.strip().strip('"')
+        _PUBKEY_CACHE = base64.b64decode(der_b64)
+        return _PUBKEY_CACHE
 
 async def create_invoice(amount_uah: int, reference: str, destination: str, comment: str, offer_id: int) -> tuple[str, str]:
     """Створює інвойс. Повертає (invoice_id, page_url)."""
@@ -111,36 +73,24 @@ async def create_invoice(amount_uah: int, reference: str, destination: str, comm
 
 
 async def verify_webhook_signature(raw_body: bytes, x_sign: str) -> bool:
-    """Перевіряємо X-Sign (ECDSA P-256). Підтримка DER і PEM публічних ключів."""
-    if settings.MONOPAY_SKIP_SIGNATURE:
-        return True  # для тестів/пісочниці
-
-    # імпорти крипти всередині, щоб не ламати середовище, якщо хтось прибрав пакет
+    """
+    Перевірка підпису MonoPay (ECDSA P-256 + SHA-256).
+    Підпис у заголовку X-Sign, дані — НЕРОЗПАРСЕНЕ тіло (raw bytes).
+    """
     try:
-        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.hazmat.primitives import serialization as ser
-    except Exception:
-        # якщо криптопакета нема — пропускаємо перевірку (краще все ж встановити cryptography)
-        return True
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        kind, keydata = await get_pubkey(client)
-
-    # підготовка сигнатури
-    try:
-        sig = _b64decode_loose(x_sign or "")
+        from cryptography.exceptions import InvalidSignature
     except Exception:
         return False
 
-    # завантаження ключа
     try:
-        if kind == "der":
-            pub = ser.load_der_public_key(keydata)
-        else:
-            pub = ser.load_pem_public_key(keydata)
+        pub_der = await _get_pubkey()
+        pub = serialization.load_der_public_key(pub_der)
+        sig = base64.b64decode(x_sign)
         pub.verify(sig, raw_body, ec.ECDSA(hashes.SHA256()))
         return True
+    except InvalidSignature:
+        return False
     except Exception:
         return False
-
