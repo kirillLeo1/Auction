@@ -88,3 +88,41 @@ async def verify_webhook_signature(raw_body: bytes, x_sign: str | None) -> bool:
     except Exception as e:
         log.info("app.monopay:MONOPAY DEBUG: verify_webhook_signature=False (%r)", e)
         return False
+
+async def create_invoice(
+    amount_uah: int,
+    reference: str,
+    destination: str,
+    comment: str,
+    offer_id: int,
+) -> tuple[str, str]:
+    """
+    Створює інвойс у MonoPay і повертає (invoice_id, page_url).
+    """
+    payload = {
+        "amount": amount_uah * 100,   # копійки
+        "ccy": 980,
+        "merchantPaymInfo": {
+            "reference": reference,
+            "destination": destination,
+            "comment": comment,
+            "basketOrder": [],
+        },
+        "redirectUrl": settings.MONOPAY_REDIRECT_URL,
+        "webHookUrl": f"{settings.BASE_URL}/monopay/webhook?offer_id={offer_id}",
+        "validity": settings.HOLD_HOURS * 3600,
+        "paymentType": "debit",
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            f"{MONO_API}/api/merchant/invoice/create",
+            headers={
+                "X-Token": settings.MONOPAY_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data["invoiceId"], data["pageUrl"]
