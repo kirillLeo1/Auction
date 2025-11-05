@@ -1,7 +1,14 @@
+# app/services/monopay.py
 import base64
+import hashlib
 import httpx
-from typing import Tuple
 from app.settings import settings
+
+# криптографія
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.exceptions import InvalidSignature
+
 
 MONO_API = "https://api.monobank.ua"
 # офіційний endpoint з доки checkout/webhooks:
