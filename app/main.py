@@ -66,51 +66,41 @@ def _dbg(msg: str, *args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MonoPay webhook: перевіряємо підпис, оновлюємо статус оффера, шлемо користувачу повідомлення
 async def _handle_monopay_webhook(request: Request) -> str:
-    # 0) сире тіло + заголовки
+    # 0) сире тіло + заголовки (для логів і підпису)
     raw = await request.body()
     body_sha = hashlib.sha256(raw).hexdigest()
-
-    # Mono інколи присилає X-Sign (офіційно) або X-Signature (деякі проксі/SDK)
     x_sign = request.headers.get("X-Sign") or request.headers.get("X-Signature")
     ctype = request.headers.get("content-type")
 
-    client = getattr(request, "client", None)
-    client_ip = getattr(client, "host", "?")
-
+    client_ip = getattr(getattr(request, "client", None), "host", "?")
     _dbg(
-        "hit POST /monopay/webhook | ip=%s | has X-Sign=%s X-Signature=%s | ctype=%s | body_sha256=%s"
-        % (
-            client_ip,
-            bool(request.headers.get("X-Sign")),
-            bool(request.headers.get("X-Signature")),
-            ctype,
-            body_sha[:16],
-        )
+        "hit POST /monopay/webhook | ip=%s | has X-Sign=%s X-Signature=%s | ctype=%s | body_sha256=%s",
+        client_ip, bool(request.headers.get("X-Sign")), bool(request.headers.get("X-Signature")),
+        ctype, body_sha[:16],
     )
 
     # 1) перевірка підпису
     if not x_sign:
-        _dbg("reject 400: missing signature header; headers_keys=%s" % list(request.headers.keys()))
+        _dbg("reject 400: missing signature header; headers=%s", list(request.headers.keys()))
         raise HTTPException(400, "Bad signature")
 
     ok = await verify_webhook_signature(raw, x_sign)
     if not ok:
-        _dbg("reject 400: signature invalid (body_sha256=%s)" % body_sha)
+        _dbg("reject 400: signature invalid (body_sha256=%s)", body_sha)
         raise HTTPException(400, "Bad signature")
 
-    # 2) парсимо JSON
+    # 2) JSON
     try:
         data = await request.json()
     except Exception:
         _dbg("reject 400: bad json")
         raise HTTPException(400, "Bad JSON")
 
-    status = data.get("status")            # created / processing / success / failure
+    status = data.get("status")       # created / processing / success / failure
     invoice_id = data.get("invoiceId")
 
-    # 3) беремо offer_id з query (?offer_id=...)
+    # 3) offer_id з query (?offer_id=...)
     try:
         offer_id = int(request.query_params.get("offer_id", "0"))
     except Exception:
@@ -120,34 +110,33 @@ async def _handle_monopay_webhook(request: Request) -> str:
         _dbg("skip: no offer_id in query")
         return "ok"
 
-    # 4) оновлюємо БД
+    # 4) оновлення БД
     async with async_session() as session:
         off = await session.get(Offer, offer_id)
         if not off:
-            _dbg(f"skip: offer {offer_id} not found")
+            _dbg("skip: offer %s not found", offer_id)
             return "ok"
 
-        # захист від не того інвойсу
+        # захист від “не того” інвойсу
         if off.invoice_id and invoice_id and off.invoice_id != invoice_id:
-            _dbg(f"skip: invoice mismatch saved={off.invoice_id} got={invoice_id}")
+            _dbg("skip: invoice mismatch saved=%s got=%s", off.invoice_id, invoice_id)
             return "ok"
 
         if status != "success":
-            _dbg(f"noop: status is not success: {status}")
+            _dbg("noop: status is not success: %s", status)
             return "ok"
 
-        # success → фіксуємо оплату
+        # зараховуємо оплату
         off.status = OfferStatus.PAID
         off.paid_at = datetime.utcnow()
         await session.flush()
 
-        # якщо усі штуки викуплені — скасовуємо інші активні пропозиції
+        # якщо все викупили — анулюємо інші активні
         lot = await session.get(Lot, off.lot_id)
         if lot:
-            from sqlalchemy import select, func
             paid_cnt = (
                 await session.execute(
-                    select(func.count()).select_from(Offer).where(
+                    select(_func.count()).select_from(Offer).where(
                         Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID
                     )
                 )
@@ -166,18 +155,32 @@ async def _handle_monopay_webhook(request: Request) -> str:
 
         await session.commit()
 
-    _dbg(f"ok: offer_id={offer_id} marked as PAID; invoice_id={invoice_id}")
+    # 5) шлемо юзеру і запускаємо однохідову форму контактів (без будь-яких лінків)
+    try:
+        await _main.bot.send_message(
+            off.user_tg_id,
+            f"✅ Оплату за лот #{lot.public_id} зараховано!\n"
+            "Будь ласка, надішліть одним повідомленням:\n"
+            "ПІБ; телефон; місто/область; тип доставки (НП відділення/поштомат/адресна); "
+            "адреса/№ відділення; коментар (за потреби)."
+        )
+        key = StorageKey(bot_id=_main.bot.id, chat_id=off.user_tg_id, user_id=off.user_tg_id)
+        await _main.dp.fsm.storage.set_state(key, state=ContactOneSG.FULL.state)
+        await _main.dp.fsm.storage.set_data(key, {"offer_id": off.id})
+    except Exception as e:
+        _dbg("warn: cannot push contact form: %r", e)
+
+    _dbg("ok: offer_id=%s marked as PAID; invoice_id=%s", offer_id, invoice_id)
     return "ok"
 
+# Публічні ендпоінти
+from fastapi import APIRouter
+from app import main as __main  # той самий файл, щоб FastAPI бачив app
 
-# Публічний ендпоінт — залиш як є, або так:
-@app.post("/monopay/webhook", response_class=PlainTextResponse)
+@__main.app.post("/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook(request: Request):
     return await _handle_monopay_webhook(request)
 
-
-
-# альтернативний шлях, якщо випадково у BASE_URL колись додаси префікс /telegram/webhook
-@app.post("/telegram/webhook/monopay/webhook", response_class=PlainTextResponse)
+@__main.app.post("/telegram/webhook/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook_alt(request: Request):
     return await _handle_monopay_webhook(request)
