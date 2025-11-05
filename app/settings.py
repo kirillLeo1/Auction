@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     MONOPAY_SKIP_SIGNATURE: bool = False
     MANAGER_CHAT_ID: int = 0
     MONOPAY_PUBKEY: str | None = None
+    DEFAULT_MIN_STEP: int = 15
 
     @computed_field
     @property
