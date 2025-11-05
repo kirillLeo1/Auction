@@ -9,7 +9,19 @@ PUBKEY_CACHE: dict[str, bytes] = {}
 MONO_API = "https://api.monobank.ua"
 
 log = logging.getLogger("app.monopay")
+def _dbg(fmt: str, *args):
+    """
+    Легка обгортка для логів. Підтримує як "fmt % args", так і просто строки.
+    Приклад: _dbg("reject 400: headers=%s", list(request.headers.keys()))
+    """
+    try:
+        msg = fmt % args if args else str(fmt)
+        _log.info("MONOPAY DEBUG: %s", msg)
+    except Exception:
+        # без фанатизму: дебаг не має роняти сервіс
+        pass
 
+__all__ = ["_dbg"]  # щоб імпорт з інших модулів був явним
 def _b64decode_loose(s: str) -> bytes:
     """Безпечне base64 (додає '=' паддінг, підтримує urlsafe)."""
     if not isinstance(s, str):
