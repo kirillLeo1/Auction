@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     TZ: str = "Europe/Kyiv"
     MONOPAY_SKIP_SIGNATURE: bool = False
     MANAGER_CHAT_ID: int = 0
+    MONOPAY_PUBKEY: str | None = None
 
     @computed_field
     @property
