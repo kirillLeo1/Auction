@@ -18,6 +18,7 @@ from app.models import Offer, OfferStatus, Lot
 from app.services.monopay import verify_webhook_signature
 import logging, hashlib
 dbg_logger = logging.getLogger("app.monopay")
+logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
