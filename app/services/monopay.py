@@ -23,11 +23,30 @@ def _b64decode_loose(s: str) -> bytes:
 
 
 async def get_pubkey(client: httpx.AsyncClient) -> Tuple[str, bytes]:
-    """Повертає ("der"/"pem", bytes). Кешуємо для швидкості."""
+    """
+    Повертає ("der"/"pem", bytes). Порядок:
+    1) Якщо MONOPAY_PUBKEY у .env — використовуємо його (DER base64 або PEM).
+    2) Інакше тягнемо з API /api/merchant/pubkey (X-Token).
+    """
     global _PUBKEY_CACHE
     if _PUBKEY_CACHE:
         return _PUBKEY_CACHE
 
+    # 1) override з .env
+    if settings.MONOPAY_PUBKEY:
+        val = settings.MONOPAY_PUBKEY.strip()
+        try:
+            if val.startswith("-----BEGIN"):
+                _PUBKEY_CACHE = ("pem", val.encode())
+            else:
+                der = _b64decode_loose(val)
+                _PUBKEY_CACHE = ("der", der)
+            return _PUBKEY_CACHE
+        except Exception:
+            # впаде -> спробуємо API
+            pass
+
+    # 2) тягнемо з API Mono
     r = await client.get(
         f"{MONO_API}/api/merchant/pubkey",
         headers={"X-Token": settings.MONOPAY_TOKEN},
@@ -37,7 +56,6 @@ async def get_pubkey(client: httpx.AsyncClient) -> Tuple[str, bytes]:
     ct = r.headers.get("content-type", "")
     body_text = r.text.strip()
 
-    # 1) спроба: JSON або просто quoted string
     b64 = None
     if "application/json" in ct:
         try:
@@ -54,7 +72,6 @@ async def get_pubkey(client: httpx.AsyncClient) -> Tuple[str, bytes]:
         else:
             b64 = body_text
 
-    # 2) спроба DER (base64)
     if b64:
         try:
             der = _b64decode_loose(b64)
@@ -63,10 +80,8 @@ async def get_pubkey(client: httpx.AsyncClient) -> Tuple[str, bytes]:
         except Exception:
             pass
 
-    # 3) fallback: PEM (raw content)
     _PUBKEY_CACHE = ("pem", r.content)
     return _PUBKEY_CACHE
-
 
 async def create_invoice(amount_uah: int, reference: str, destination: str, comment: str, offer_id: int) -> tuple[str, str]:
     """Створює інвойс. Повертає (invoice_id, page_url)."""
