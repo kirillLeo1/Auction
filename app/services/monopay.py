@@ -7,9 +7,12 @@ MONO_API = "https://api.monobank.ua"
 # офіційний endpoint з доки checkout/webhooks:
 PUBKEY_URL = f"{MONO_API}/personal/checkout/signature/public/key"
 
-_PUBKEY_CACHE: bytes | None = None
+PUBKEY_CACHE: dict[str, bytes] = {}
 
-
+def _dbg(msg: str):
+    import logging
+    logging.getLogger("app.monopay").info("MONOPAY DEBUG: " + msg)
+    
 def _b64decode_loose(s: str) -> bytes:
     """Base64 із автопаддінгом + urlsafe fallback."""
     s = (s or "").strip().replace("\n", "").replace("\r", "")
@@ -25,25 +28,25 @@ def _b64decode_loose(s: str) -> bytes:
     raise ValueError("bad base64")
 
 
-async def _get_pubkey() -> bytes:
-    """
-    1) Якщо в .env задано MONOPAY_PUBKEY (DER/base64) — беремо його.
-    2) Інакше тягнемо через офіційний endpoint (DER/base64) і кешуємо.
-    """
-    global _PUBKEY_CACHE
-    if settings.__dict__.get("MONOPAY_PUBKEY"):
-        # у .env зберігаємо ПУБЛІЧНИЙ ключ у base64 (DER)
-        return base64.b64decode(settings.MONOPAY_PUBKEY)
+async def get_pubkey_der() -> bytes:
+    """Отримує DER публічний ключ (спочатку з env, інакше з API за X-Token)."""
+    if "pub" in PUBKEY_CACHE:
+        return PUBKEY_CACHE["pub"]
 
-    if _PUBKEY_CACHE:
-        return _PUBKEY_CACHE
+    if getattr(settings, "MONOPAY_PUBKEY", None):
+        b64 = settings.MONOPAY_PUBKEY.strip().strip('"').replace("\n", "")
+        PUBKEY_CACHE["pub"] = base64.b64decode(b64)
+        _dbg(f"pubkey source=ENV fp={hashlib.sha256(PUBKEY_CACHE['pub']).hexdigest()[:16]}")
+        return PUBKEY_CACHE["pub"]
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(PUBKEY_URL, headers={"X-Token": settings.MONOPAY_TOKEN})
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(f"{MONO_API}/api/merchant/pubkey",
+                             headers={"X-Token": settings.MONOPAY_TOKEN})
         r.raise_for_status()
-        der_b64 = r.text.strip().strip('"')
-        _PUBKEY_CACHE = base64.b64decode(der_b64)
-        return _PUBKEY_CACHE
+        b64 = r.text.strip().strip('"')
+        PUBKEY_CACHE["pub"] = base64.b64decode(b64)
+        _dbg(f"pubkey source=API fp={hashlib.sha256(PUBKEY_CACHE['pub']).hexdigest()[:16]}")
+        return PUBKEY_CACHE["pub"]
 
 async def create_invoice(amount_uah: int, reference: str, destination: str, comment: str, offer_id: int) -> tuple[str, str]:
     """Створює інвойс. Повертає (invoice_id, page_url)."""
@@ -73,24 +76,21 @@ async def create_invoice(amount_uah: int, reference: str, destination: str, comm
 
 
 async def verify_webhook_signature(raw_body: bytes, x_sign: str) -> bool:
-    """
-    Перевірка підпису MonoPay (ECDSA P-256 + SHA-256).
-    Підпис у заголовку X-Sign, дані — НЕРОЗПАРСЕНЕ тіло (raw bytes).
-    """
+    """Перевіряє X-Sign: ECDSA P-256 + SHA-256 по сирому body."""
     try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.exceptions import InvalidSignature
-    except Exception:
-        return False
-
-    try:
-        pub_der = await _get_pubkey()
+        pub_der = await get_pubkey_der()
         pub = serialization.load_der_public_key(pub_der)
+
         sig = base64.b64decode(x_sign)
+        body_sha = hashlib.sha256(raw_body).hexdigest()
+
+        _dbg(f"verify_webhook_signature: x_sign_len={len(x_sign)} body_sha256={body_sha}")
+
         pub.verify(sig, raw_body, ec.ECDSA(hashes.SHA256()))
         return True
     except InvalidSignature:
+        _dbg("verify_webhook_signature: InvalidSignature (підпис не співпав)")
         return False
-    except Exception:
+    except Exception as e:
+        _dbg(f"verify_webhook_signature: exception={type(e).__name__} {e}")
         return False
