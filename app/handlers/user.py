@@ -299,31 +299,31 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
 
    # Формуємо ОДИН caption: спочатку опис лота (як написав адмін),
 # нижче — заявка (статус/ціна/контакти). Без «жирних шапок».
-desc_text = (lot.title or "").strip()              # тут у тебе весь опис поста
-if not desc_text:
-    desc_text = f"Лот #{lot.public_id}"            # підстраховка, якщо опис порожній
+    desc_text = (lot.title or "").strip()              # тут у тебе весь опис поста
+    if not desc_text:
+        desc_text = f"Лот #{lot.public_id}"            # підстраховка, якщо опис порожній
 
-order_block = (
-    f"\n\n<b>Заявка</b> — <b>{tag}</b>\n"
-    f"Ціна: <b>{off.offered_price} грн</b>\n"
-    f"Покупець: {user_link}\n"
-    f"{msg.text}"
-)
+    order_block = (
+        f"\n\n<b>Заявка</b> — <b>{tag}</b>\n"
+        f"Ціна: <b>{off.offered_price} грн</b>\n"
+        f"Покупець: {user_link}\n"
+        f"{msg.text}"
+    )
 
 # Якщо хочеш взагалі без рядка з ID — просто прибери наступний рядок із ID
-base_caption = f"{desc_text}\n\nID лота — #{lot.public_id}{order_block}"
+    base_caption = f"{desc_text}\n\nID лота — #{lot.public_id}{order_block}"
 
 # Ліміт підпису ~1024 — спочатку збережемо заявку цілою, уріжемо тільки опис
-if len(base_caption) > 1024:
-    fixed_tail = f"\n\nID лота — #{lot.public_id}{order_block}"
-    max_desc = 1024 - len(fixed_tail)
+    if len(base_caption) > 1024:
+        fixed_tail = f"\n\nID лота — #{lot.public_id}{order_block}"
+        max_desc = 1024 - len(fixed_tail)
     # мінімальна страховка, щоб не піти в мінус
-    if max_desc < 10:
+        if max_desc < 10:
         # якщо опис надто довгий, лишаємо тільки заявку + ID
-        base_caption = fixed_tail.lstrip()
-    else:
-        desc_cut = desc_text[:max_desc-3] + "..."
-        base_caption = f"{desc_cut}{fixed_tail}"
+            base_caption = fixed_tail.lstrip()
+        else:
+            desc_cut = desc_text[:max_desc-3] + "..."
+            base_caption = f"{desc_cut}{fixed_tail}"
 
 
     sent = False
