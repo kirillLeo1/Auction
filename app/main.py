@@ -87,30 +87,30 @@ async def monopay_webhook(request: Request) -> str:
 
     client_ip = getattr(getattr(request, "client", None), "host", "?")
     _dbg(
-        "MONOPAY DEBUG: hit POST /monopay/webhook | ip=%s | has X-Sign=True X-Signature=%s | ctype=%s | body_sha256=%s",
+        "hit POST /monopay/webhook | ip=%s | has X-Sign=True X-Signature=%s | ctype=%s | body_sha256=%s",
         client_ip, bool(request.headers.get("X-Signature")), ctype, body_sha[:16]
     )
 
     # 1) перевірка підпису
     if not x_sign:
-        _dbg("MONOPAY DEBUG: reject 400: missing signature header; headers_keys=%s", list(request.headers.keys()))
+        _dbg("reject 400: missing signature header; headers_keys=%s", list(request.headers.keys()))
         raise HTTPException(400, "Bad signature")
 
     ok = await verify_webhook_signature(raw, x_sign)
-    _dbg("MONOPAY DEBUG: verify_webhook_signature=%s (x_sign_len=%s)", ok, len(x_sign))
+    _dbg("verify_webhook_signature=%s (x_sign_len=%s)", ok, len(x_sign))
     if not ok:
-        _dbg("MONOPAY DEBUG: reject 400: signature invalid (body_sha256=%s)", body_sha)
+        _dbg("reject 400: signature invalid (body_sha256=%s)", body_sha)
         raise HTTPException(400, "Bad signature")
 
     # 2) JSON
     try:
         data = await request.json()
     except Exception:
-        _dbg("MONOPAY DEBUG: reject 400: bad json")
+        _dbg("reject 400: bad json")
         raise HTTPException(400, "Bad JSON")
 
     status: str = data.get("status")
-    invoice_id: str = data.get("invoiceId")
+    invoice_id: str = data.get("invoiceId")  # на всяк, для дебагу/аудиту
 
     # 3) offer_id з query (?offer_id=..)
     offer_id_raw = request.query_params.get("offer_id")
@@ -120,29 +120,34 @@ async def monopay_webhook(request: Request) -> str:
         offer_id = None
 
     if not offer_id:
-        _dbg("MONOPAY DEBUG: noop: no offer_id in webhook")
+        _dbg("noop: no offer_id in webhook")
         return "ok"
 
-    # 4) тягнемо офер і реагуємо на статус
+    # 4) дістаємо оффер і реагуємо на статус
     async with async_session() as session:
         off: Offer | None = await session.get(Offer, offer_id)
         if not off:
-            _dbg("MONOPAY DEBUG: noop: offer not found id=%s", offer_id)
+            _dbg("noop: offer not found id=%s", offer_id)
             return "ok"
 
+        # тільки фінальний статус цікавить
         if status in ("created", "processing"):
-            _dbg("MONOPAY DEBUG: noop: status=%s", status)
+            _dbg("noop: status=%s", status)
             return "ok"
 
         if status != "success":
-            _dbg("MONOPAY DEBUG: noop: status is not success: %s", status)
+            _dbg("noop: status is not success: %s", status)
             return "ok"
 
-        # 5) success -> позначаємо оплаченим
+        # 5) success → позначаємо оплаченим
         off.status = OfferStatus.PAID
         off.paid_at = datetime.utcnow()
         await session.commit()
         await session.refresh(off)
+
+        # тягнемо лот, бо public_id у лота
+        lot = await session.get(Lot, off.lot_id)
+        lot_public = getattr(lot, "public_id", off.id) if lot else off.id
 
         # 6) Штовхаємо юзеру форму контактів БЕЗ ЛІНКА і ставимо FSM на one-shot
         try:
@@ -151,13 +156,13 @@ async def monopay_webhook(request: Request) -> str:
             await ctx.update_data(offer_id=off.id)
 
             msg = (
-                f"✅ Оплату за лот #{off.public_id} зараховано!\n\n"
+                f"✅ Оплату за лот #{lot_public} зараховано!\n\n"
                 "Відправте одним повідомленням ваші дані у довільному форматі:\n"
                 "— ПІБ\n— місто/область\n— НП/УП + відділення або адреса\n— телефон\n— коментар (за потреби)\n\n"
-                "Просто напишіть все в ОДНОМУ повідомленні у відповідь на це."
+                "Напишіть все В ОДНОМУ повідомленні у відповідь на це."
             )
             await bot.send_message(off.user_tg_id, msg)
         except Exception as e:
-            _dbg("MONOPAY DEBUG: warn: cannot push contact form: %r", e)
+            _dbg("warn: cannot push contact form: %r", e)
 
     return "ok"
