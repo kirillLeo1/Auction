@@ -77,7 +77,7 @@ async def health():
 
 
 # ── MonoPay webhook
-@api.post("/monopay/webhook")
+@app.post("/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook(request: Request) -> str:
     # 0) сире тіло + заголовки (для логів і підпису)
     raw = await request.body()
