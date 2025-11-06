@@ -70,6 +70,71 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AuctionBot", lifespan=lifespan)
 
+# --- helpers: визначити кількість лота та ідентифікатори поста в каналі ---
+
+def _lot_qty(lot) -> int:
+    """Пробуємо взяти кількість із найтиповіших полів; дефолт 1."""
+    for name in ("quantity", "qty", "count", "stock", "amount"):
+        v = getattr(lot, name, None)
+        if isinstance(v, int) and v > 0:
+            return v
+        try:
+            if v is not None:
+                vv = int(v)
+                if vv > 0:
+                    return vv
+        except Exception:
+            pass
+    return 1
+
+def _lot_post_ids(lot):
+    """Повертає (chat_id, message_id) для поста лота, якщо є."""
+    chat_id = (
+        getattr(lot, "channel_id", None)
+        or getattr(lot, "post_chat_id", None)
+        or getattr(lot, "tg_channel_id", None)
+        or getattr(lot, "tg_chat_id", None)
+    )
+    msg_id = (
+        getattr(lot, "message_id", None)
+        or getattr(lot, "post_message_id", None)
+        or getattr(lot, "tg_message_id", None)
+    )
+    return chat_id, msg_id
+
+async def _maybe_delete_lot_post(session, lot):
+    """
+    Видаляє пост з каналу, якщо лот розкупили.
+    Рішення приймається за фактом: paid_count >= lot_qty.
+    """
+    from sqlalchemy import select as _select
+    from sqlalchemy import func as _func
+    from app.models import Offer, OfferStatus  # щоб не плодити імпорти вище
+
+    qty = _lot_qty(lot)
+
+    # рахуємо, скільки реально ОПЛАЧЕНО офферів по цьому лоту
+    q = _select(_func.count(Offer.id)).where(
+        Offer.lot_id == lot.id,
+        Offer.status == OfferStatus.PAID,
+    )
+    res = await session.execute(q)
+    paid_count = int(res.scalar_one() or 0)
+
+    remaining = qty - paid_count
+    _dbg("LOT CHECK: lot_id=%s qty=%s paid=%s remaining=%s", lot.id, qty, paid_count, remaining)
+
+    if remaining <= 0:
+        chat_id, msg_id = _lot_post_ids(lot)
+        if chat_id and msg_id:
+            try:
+                await bot.delete_message(chat_id, msg_id)
+                _dbg("LOT POST DELETED: lot_id=%s chat_id=%s msg_id=%s", lot.id, chat_id, msg_id)
+            except Exception as e:
+                _dbg("WARN: cannot delete lot post (lot_id=%s): %r", lot.id, e)
+        else:
+            _dbg("INFO: no channel post ids stored on lot_id=%s; nothing to delete", lot.id)
+
 
 @app.get("/health")
 async def health():
@@ -148,7 +213,8 @@ async def monopay_webhook(request: Request) -> str:
         # тягнемо лот, бо public_id у лота
         lot = await session.get(Lot, off.lot_id)
         lot_public = getattr(lot, "public_id", off.id) if lot else off.id
-
+        if lot:
+            await _maybe_delete_lot_post(session, lot)
         # 6) Штовхаємо юзеру форму контактів БЕЗ ЛІНКА і ставимо FSM на one-shot
         try:
             ctx = dp.fsm.get_context(bot=bot, user_id=off.user_tg_id, chat_id=off.user_tg_id)
