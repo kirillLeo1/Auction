@@ -1,36 +1,50 @@
+# app/main.py
 import asyncio
+import hashlib
+import logging
+from datetime import datetime
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.base import StorageKey
-from sqlalchemy import select
-from sqlalchemy import func as _func
+
+from sqlalchemy import select, func
 
 from app.settings import settings
 from app.db import init_models, async_session
 from app.handlers.admin import admin_router
 from app.handlers.user import user_router
-from app.handlers.user import ContactOneSG   # <- одношагова форма
 from app.services.cascade import advance_cascade
 from app.models import Offer, OfferStatus, Lot
-from app.services.monopay import verify_webhook_signature, _dbg
-import logging, hashlib
-from datetime import datetime
-from fastapi import APIRouter
-from app import main as __main  # той самий файл, щоб FastAPI бачив app
+from app.services.monopay import verify_webhook_signature
 
-dbg_logger = logging.getLogger("app.monopay")
+# ── Логирование (включай MONOPAY_DEBUG=1 в .env, чтобы видеть отладку)
 logging.basicConfig(level=logging.INFO)
+dbg_logger = logging.getLogger("app.monopay")
 
+
+def _dbg(msg: str, *args):
+    """Лёгкий дебаг-логгер, который пишет только если MONOPAY_DEBUG включён."""
+    try:
+        if getattr(settings, "MONOPAY_DEBUG", False):
+            dbg_logger.info("MONOPAY DEBUG: " + msg, *args)
+    except Exception:
+        pass
+
+
+# ── Aiogram
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(admin_router)
 dp.include_router(user_router)
 
+
 async def _polling_task():
     await dp.start_polling(bot)
+
 
 async def _scheduler_task():
     while True:
@@ -40,6 +54,8 @@ async def _scheduler_task():
             pass
         await asyncio.sleep(30)
 
+
+# ── FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_models()
@@ -51,35 +67,33 @@ async def lifespan(app: FastAPI):
         for t in (t1, t2):
             t.cancel()
 
+
 app = FastAPI(title="AuctionBot", lifespan=lifespan)
+
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-def _dbg(msg: str, *args):
-    try:
-        from app.settings import settings
-        if getattr(settings, "MONOPAY_DEBUG", False):
-            dbg_logger.info("MONOPAY DEBUG: " + msg, *args)
-    except Exception:
-        pass
 
-
+# ── MonoPay webhook
 @app.post("/monopay/webhook", response_class=PlainTextResponse)
-async def monopay_webhook(request: Request):
-    # 0) тіло + заголовки (для дебагу)
+async def monopay_webhook(request: Request) -> str:
+    # 0) тело и заголовки (для дебага)
     raw = await request.body()
     body_sha = hashlib.sha256(raw).hexdigest()
     x_sign = request.headers.get("X-Sign")
     ctype = request.headers.get("content-type")
-
     client_ip = getattr(getattr(request, "client", None), "host", "?")
-    _dbg("hit POST /monopay/webhook | ip=%s | has X-Sign=True X-Signature=%s | ctype=%s | body_sha256=%s",
-         client_ip, "True" if x_sign else "False", ctype, body_sha[:16])
 
-    # 1) перевірка підпису
+    _dbg(
+        "hit POST /monopay/webhook | ip=%s | has X-Sign=%s | ctype=%s | body_sha256=%s",
+        client_ip, bool(x_sign), ctype, body_sha[:16],
+    )
+
+    # 1) проверка подписи
     if not x_sign or not await verify_webhook_signature(raw, x_sign):
+        _dbg("reject 400: signature invalid (body_sha256=%s)", body_sha)
         raise HTTPException(400, "Bad signature")
 
     # 2) JSON
@@ -89,11 +103,11 @@ async def monopay_webhook(request: Request):
         _dbg("reject 400: bad json")
         raise HTTPException(400, "Bad JSON")
 
-    status    = data.get("status")           # created / processing / success / failure
+    status = data.get("status")        # created / processing / success / failure
     invoice_id = data.get("invoiceId")
-    offer_id   = int(request.query_params.get("offer_id", "0") or 0)
+    offer_id = int(request.query_params.get("offer_id", "0") or 0)
 
-    # 3) Неуспішні/проміжні стани просто ігноруємо (200 ОК)
+    # 3) промежуточные/неуспешные статусы просто подтверждаем 200 OK
     if status in ("created", "processing"):
         _dbg("noop: status is not success: %s", status)
         return "ok"
@@ -101,7 +115,7 @@ async def monopay_webhook(request: Request):
         _dbg("noop: status=%s (not success)", status)
         return "ok"
 
-    # 4) success → відмічаємо оплату, відміняємо інших якщо треба, шлемо DM
+    # 4) success → отмечаем оплату, каскадно закрываем остальных при необходимости
     async with async_session() as session:
         off: Offer | None = await session.get(Offer, offer_id)
         if not off:
@@ -109,24 +123,27 @@ async def monopay_webhook(request: Request):
             return "ok"
 
         if off.invoice_id and off.invoice_id != invoice_id:
-            _dbg("warn: invoice mismatch offer=%s off.invoice_id=%s got=%s", offer_id, off.invoice_id, invoice_id)
+            _dbg(
+                "warn: invoice mismatch offer=%s expected=%s got=%s",
+                offer_id, off.invoice_id, invoice_id
+            )
             return "ok"
 
         off.status = OfferStatus.PAID
         off.paid_at = datetime.utcnow()
-        # (на всяк) збережемо invoice_id, якщо ще не зберігали
         if not off.invoice_id:
             off.invoice_id = invoice_id
         await session.flush()
 
         lot: Lot = await session.get(Lot, off.lot_id)
 
-        # Якщо кількість вибрана — інші активні пропозиції закриваємо
+        # если набрали нужное количество — закрыть активные предложения
         paid_cnt = (await session.execute(
-            select(func.count()).select_from(Offer).where(
-                Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID
-            )
+            select(func.count())
+            .select_from(Offer)
+            .where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID)
         )).scalar_one()
+
         if paid_cnt >= lot.quantity:
             others = (await session.execute(
                 select(Offer).where(
@@ -140,7 +157,7 @@ async def monopay_webhook(request: Request):
         await session.commit()
         _dbg("offer_id=%s marked as PAID; invoice_id=%s", offer_id, invoice_id)
 
-    # 5) Пінгаємо користувача (ОСЬ ТУТ головне — вже без всяких _main)
+    # 5) пушим пользователю форму контактов через deep-link
     try:
         me = await bot.get_me()
         link = f"https://t.me/{me.username}?start=contact_{offer_id}"
