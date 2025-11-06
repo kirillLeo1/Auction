@@ -297,17 +297,34 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
     tag = "Оплачено" if off.status == OfferStatus.PAID else "Відкладено"
     user_link = f"@{msg.from_user.username}" if msg.from_user.username else f"id:{msg.from_user.id}"
 
-    # Підпис для першого фото/повідомлення (влізає в ліміт caption)
-    base_caption = (
-        f"<b>{lot.title}</b>\n"
-        f"ID лота — #{lot.public_id}\n"
-        f"Ціна: <b>{off.offered_price} грн</b>\n"
-        f"Статус: <b>{tag}</b>\n\n"
-        f"<u>Заявка від {user_link}:</u>\n{msg.text}"
-    )
-    # Телеграм ліміт підпису ~1024 символи — підріжемо, якщо що
-    if len(base_caption) > 1024:
-        base_caption = base_caption[:1021] + "..."
+   # Формуємо ОДИН caption: спочатку опис лота (як написав адмін),
+# нижче — заявка (статус/ціна/контакти). Без «жирних шапок».
+desc_text = (lot.title or "").strip()              # тут у тебе весь опис поста
+if not desc_text:
+    desc_text = f"Лот #{lot.public_id}"            # підстраховка, якщо опис порожній
+
+order_block = (
+    f"\n\n<b>Заявка</b> — <b>{tag}</b>\n"
+    f"Ціна: <b>{off.offered_price} грн</b>\n"
+    f"Покупець: {user_link}\n"
+    f"{msg.text}"
+)
+
+# Якщо хочеш взагалі без рядка з ID — просто прибери наступний рядок із ID
+base_caption = f"{desc_text}\n\nID лота — #{lot.public_id}{order_block}"
+
+# Ліміт підпису ~1024 — спочатку збережемо заявку цілою, уріжемо тільки опис
+if len(base_caption) > 1024:
+    fixed_tail = f"\n\nID лота — #{lot.public_id}{order_block}"
+    max_desc = 1024 - len(fixed_tail)
+    # мінімальна страховка, щоб не піти в мінус
+    if max_desc < 10:
+        # якщо опис надто довгий, лишаємо тільки заявку + ID
+        base_caption = fixed_tail.lstrip()
+    else:
+        desc_cut = desc_text[:max_desc-3] + "..."
+        base_caption = f"{desc_cut}{fixed_tail}"
+
 
     sent = False
     target_chat = settings.MANAGER_CHAT_ID or 0
