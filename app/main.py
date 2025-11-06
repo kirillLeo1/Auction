@@ -88,7 +88,7 @@ def _lot_qty(lot) -> int:
     return 1
 
 def _lot_post_ids(lot):
-    """Повертає (chat_id, message_id) для поста лота, якщо є."""
+    """Возвращает (chat_id, message_id) поста лота. Жёстко учитываем channel_message_id."""
     chat_id = (
         getattr(lot, "channel_id", None)
         or getattr(lot, "post_chat_id", None)
@@ -96,11 +96,24 @@ def _lot_post_ids(lot):
         or getattr(lot, "tg_chat_id", None)
     )
     msg_id = (
-        getattr(lot, "message_id", None)
+        getattr(lot, "channel_message_id", None)    # << ключевое поле из модели
+        or getattr(lot, "message_id", None)
         or getattr(lot, "post_message_id", None)
         or getattr(lot, "tg_message_id", None)
     )
+
+    # Нормализуем в int (у каналов chat_id отрицательный: -100...)
+    try:
+        chat_id = int(chat_id) if chat_id is not None else None
+    except Exception:
+        pass
+    try:
+        msg_id = int(msg_id) if msg_id is not None else None
+    except Exception:
+        pass
+
     return chat_id, msg_id
+
 
 async def _maybe_delete_lot_post(session, lot):
     """
