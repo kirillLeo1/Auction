@@ -174,10 +174,6 @@ async def _handle_monopay_webhook(request: Request) -> str:
     _dbg("ok: offer_id=%s marked as PAID; invoice_id=%s", offer_id, invoice_id)
     return "ok"
 
-# Публічні ендпоінти
-from fastapi import APIRouter
-from app import main as __main  # той самий файл, щоб FastAPI бачив app
-
 @__main.app.post("/monopay/webhook", response_class=PlainTextResponse)
 async def monopay_webhook(request: Request):
     return await _handle_monopay_webhook(request)
