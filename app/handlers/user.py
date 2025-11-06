@@ -242,7 +242,7 @@ async def cb_postpone(call: CallbackQuery, state: FSMContext):
     await state.update_data(offer_id=offer_id)
     await state.set_state(ContactOneSG.ONE)
     await call.message.answer(
-        "Окей, відкладаємо. Надішліть ваші дані одним повідомленням (будь-який формат, приклад є у /start)."
+        "Окей, відкладаємо. Надішліть ваші дані одним повідомленням (ПІБ / Місто / відділення нп/уп / телефон)."
     )
     await call.answer()
 
@@ -369,5 +369,5 @@ async def one_shot_contacts(msg: Message, state: FSMContext, bot: Bot):
             except Exception:
                 pass
 
-    await msg.answer("Дякуємо! Дані отримано. Менеджер вже бачить вашу заявку.")
+    await msg.answer("Дякуємо! Дані отримано. Менеджер вже розглядає вашу заявку.")
     await state.clear()
