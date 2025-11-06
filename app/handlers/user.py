@@ -198,7 +198,7 @@ async def place_bid(msg: Message, state: FSMContext, bot: Bot):
         f"<b>{title}</b>\n\n"
         f"Поточна ціна: <b>{amount} грн</b>\n"
         f"Крок: {step} грн\n\n"
-        f"<a href=\"https://t.me/{username}?start=lot_{pub_id}\">Бронь</a>\n\n"
+        f"<a href=\"https://t.me/{username}?start=lot_{pub_id}\">БРОНЬ</a>\n\n"
         f"ID лота — #{pub_id}"
     )
     if chan_mid:
@@ -210,7 +210,7 @@ async def place_bid(msg: Message, state: FSMContext, bot: Bot):
             await bot.send_message(
                 prev_leader_id,
                 f"⚠️ Вас перебили у #{pub_id}. Нова ціна {amount} грн.\n"
-                f"<a href=\"https://t.me/{username}?start=lot_{pub_id}\">Бронь</a>",
+                f"<a href=\"https://t.me/{username}?start=lot_{pub_id}\">БРОНЬ</a>",
                 parse_mode="HTML",
             )
         except Exception:
