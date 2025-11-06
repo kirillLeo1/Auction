@@ -66,29 +66,20 @@ def _dbg(msg: str, *args):
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-async def _handle_monopay_webhook(request: Request) -> str:
-    # 0) сире тіло + заголовки (для логів і підпису)
+@app.post("/monopay/webhook", response_class=PlainTextResponse)
+async def monopay_webhook(request: Request):
+    # 0) тіло + заголовки (для дебагу)
     raw = await request.body()
     body_sha = hashlib.sha256(raw).hexdigest()
-    x_sign = request.headers.get("X-Sign") or request.headers.get("X-Signature")
+    x_sign = request.headers.get("X-Sign")
     ctype = request.headers.get("content-type")
 
     client_ip = getattr(getattr(request, "client", None), "host", "?")
-    _dbg(
-        "hit POST /monopay/webhook | ip=%s | has X-Sign=%s X-Signature=%s | ctype=%s | body_sha256=%s",
-        client_ip, bool(request.headers.get("X-Sign")), bool(request.headers.get("X-Signature")),
-        ctype, body_sha[:16],
-    )
+    _dbg("hit POST /monopay/webhook | ip=%s | has X-Sign=True X-Signature=%s | ctype=%s | body_sha256=%s",
+         client_ip, "True" if x_sign else "False", ctype, body_sha[:16])
 
     # 1) перевірка підпису
-    if not x_sign:
-        _dbg("reject 400: missing signature header; headers=%s", list(request.headers.keys()))
-        raise HTTPException(400, "Bad signature")
-
-    ok = await verify_webhook_signature(raw, x_sign)
-    if not ok:
-        _dbg("reject 400: signature invalid (body_sha256=%s)", body_sha)
+    if not x_sign or not await verify_webhook_signature(raw, x_sign):
         raise HTTPException(400, "Bad signature")
 
     # 2) JSON
@@ -98,86 +89,67 @@ async def _handle_monopay_webhook(request: Request) -> str:
         _dbg("reject 400: bad json")
         raise HTTPException(400, "Bad JSON")
 
-    status = data.get("status")       # created / processing / success / failure
+    status    = data.get("status")           # created / processing / success / failure
     invoice_id = data.get("invoiceId")
+    offer_id   = int(request.query_params.get("offer_id", "0") or 0)
 
-    # 3) offer_id з query (?offer_id=...)
-    try:
-        offer_id = int(request.query_params.get("offer_id", "0"))
-    except Exception:
-        offer_id = 0
-
-    if not offer_id:
-        _dbg("skip: no offer_id in query")
+    # 3) Неуспішні/проміжні стани просто ігноруємо (200 ОК)
+    if status in ("created", "processing"):
+        _dbg("noop: status is not success: %s", status)
+        return "ok"
+    if status != "success":
+        _dbg("noop: status=%s (not success)", status)
         return "ok"
 
-    # 4) оновлення БД
+    # 4) success → відмічаємо оплату, відміняємо інших якщо треба, шлемо DM
     async with async_session() as session:
-        off = await session.get(Offer, offer_id)
+        off: Offer | None = await session.get(Offer, offer_id)
         if not off:
-            _dbg("skip: offer %s not found", offer_id)
+            _dbg("warn: offer %s not found", offer_id)
             return "ok"
 
-        # захист від “не того” інвойсу
-        if off.invoice_id and invoice_id and off.invoice_id != invoice_id:
-            _dbg("skip: invoice mismatch saved=%s got=%s", off.invoice_id, invoice_id)
+        if off.invoice_id and off.invoice_id != invoice_id:
+            _dbg("warn: invoice mismatch offer=%s off.invoice_id=%s got=%s", offer_id, off.invoice_id, invoice_id)
             return "ok"
 
-        if status != "success":
-            _dbg("noop: status is not success: %s", status)
-            return "ok"
-
-        # зараховуємо оплату
         off.status = OfferStatus.PAID
         off.paid_at = datetime.utcnow()
+        # (на всяк) збережемо invoice_id, якщо ще не зберігали
+        if not off.invoice_id:
+            off.invoice_id = invoice_id
         await session.flush()
 
-        # якщо все викупили — анулюємо інші активні
-        lot = await session.get(Lot, off.lot_id)
-        if lot:
-            paid_cnt = (
-                await session.execute(
-                    select(_func.count()).select_from(Offer).where(
-                        Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID
-                    )
+        lot: Lot = await session.get(Lot, off.lot_id)
+
+        # Якщо кількість вибрана — інші активні пропозиції закриваємо
+        paid_cnt = (await session.execute(
+            select(func.count()).select_from(Offer).where(
+                Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID
+            )
+        )).scalar_one()
+        if paid_cnt >= lot.quantity:
+            others = (await session.execute(
+                select(Offer).where(
+                    Offer.lot_id == lot.id,
+                    Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])
                 )
-            ).scalar_one()
-            if paid_cnt >= lot.quantity:
-                others = (
-                    await session.execute(
-                        select(Offer).where(
-                            Offer.lot_id == lot.id,
-                            Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED]),
-                        )
-                    )
-                ).scalars().all()
-                for o in others:
-                    o.status = OfferStatus.CANCELED
+            )).scalars().all()
+            for o in others:
+                o.status = OfferStatus.CANCELED
 
         await session.commit()
+        _dbg("offer_id=%s marked as PAID; invoice_id=%s", offer_id, invoice_id)
 
-    # 5) шлемо юзеру і запускаємо однохідову форму контактів (без будь-яких лінків)
+    # 5) Пінгаємо користувача (ОСЬ ТУТ головне — вже без всяких _main)
     try:
-        await _main.bot.send_message(
+        me = await bot.get_me()
+        link = f"https://t.me/{me.username}?start=contact_{offer_id}"
+        await bot.send_message(
             off.user_tg_id,
             f"✅ Оплату за лот #{lot.public_id} зараховано!\n"
-            "Будь ласка, надішліть одним повідомленням:\n"
-            "ПІБ; телефон; місто/область; тип доставки (НП відділення/поштомат/адресна); "
-            "адреса/№ відділення; коментар (за потреби)."
+            f"Натисніть, щоб заповнити контактні дані: {link}"
         )
-        key = StorageKey(bot_id=_main.bot.id, chat_id=off.user_tg_id, user_id=off.user_tg_id)
-        await _main.dp.fsm.storage.set_state(key, state=ContactOneSG.FULL.state)
-        await _main.dp.fsm.storage.set_data(key, {"offer_id": off.id})
     except Exception as e:
         _dbg("warn: cannot push contact form: %r", e)
 
-    _dbg("ok: offer_id=%s marked as PAID; invoice_id=%s", offer_id, invoice_id)
     return "ok"
-
-@__main.app.post("/monopay/webhook", response_class=PlainTextResponse)
-async def monopay_webhook(request: Request):
-    return await _handle_monopay_webhook(request)
-
-@__main.app.post("/telegram/webhook/monopay/webhook", response_class=PlainTextResponse)
-async def monopay_webhook_alt(request: Request):
-    return await _handle_monopay_webhook(request)
