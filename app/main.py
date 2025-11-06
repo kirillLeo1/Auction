@@ -4,7 +4,7 @@ import hashlib
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
-
+from app.handlers.user import ContactOneSG
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 
@@ -77,96 +77,87 @@ async def health():
 
 
 # ── MonoPay webhook
-@app.post("/monopay/webhook", response_class=PlainTextResponse)
+@api.post("/monopay/webhook")
 async def monopay_webhook(request: Request) -> str:
-    # 0) тело и заголовки (для дебага)
+    # 0) сире тіло + заголовки (для логів і підпису)
     raw = await request.body()
     body_sha = hashlib.sha256(raw).hexdigest()
-    x_sign = request.headers.get("X-Sign")
+    x_sign = request.headers.get("X-Sign") or request.headers.get("X-Signature")
     ctype = request.headers.get("content-type")
-    client_ip = getattr(getattr(request, "client", None), "host", "?")
 
+    client_ip = getattr(getattr(request, "client", None), "host", "?")
     _dbg(
-        "hit POST /monopay/webhook | ip=%s | has X-Sign=%s | ctype=%s | body_sha256=%s",
-        client_ip, bool(x_sign), ctype, body_sha[:16],
+        "MONOPAY DEBUG: hit POST /monopay/webhook | ip=%s | has X-Sign=True X-Signature=%s | ctype=%s | body_sha256=%s",
+        client_ip, bool(request.headers.get("X-Signature")), ctype, body_sha[:16]
     )
 
-    # 1) проверка подписи
-    if not x_sign or not await verify_webhook_signature(raw, x_sign):
-        _dbg("reject 400: signature invalid (body_sha256=%s)", body_sha)
+    # 1) перевірка підпису
+    if not x_sign:
+        _dbg("MONOPAY DEBUG: reject 400: missing signature header; headers_keys=%s", list(request.headers.keys()))
+        raise HTTPException(400, "Bad signature")
+
+    ok = await verify_webhook_signature(raw, x_sign)
+    _dbg("MONOPAY DEBUG: verify_webhook_signature=%s (x_sign_len=%s)", ok, len(x_sign))
+    if not ok:
+        _dbg("MONOPAY DEBUG: reject 400: signature invalid (body_sha256=%s)", body_sha)
         raise HTTPException(400, "Bad signature")
 
     # 2) JSON
     try:
         data = await request.json()
     except Exception:
-        _dbg("reject 400: bad json")
+        _dbg("MONOPAY DEBUG: reject 400: bad json")
         raise HTTPException(400, "Bad JSON")
 
-    status = data.get("status")        # created / processing / success / failure
-    invoice_id = data.get("invoiceId")
-    offer_id = int(request.query_params.get("offer_id", "0") or 0)
+    status: str = data.get("status")
+    invoice_id: str = data.get("invoiceId")
 
-    # 3) промежуточные/неуспешные статусы просто подтверждаем 200 OK
-    if status in ("created", "processing"):
-        _dbg("noop: status is not success: %s", status)
-        return "ok"
-    if status != "success":
-        _dbg("noop: status=%s (not success)", status)
+    # 3) offer_id з query (?offer_id=..)
+    offer_id_raw = request.query_params.get("offer_id")
+    try:
+        offer_id = int(offer_id_raw) if offer_id_raw is not None else None
+    except ValueError:
+        offer_id = None
+
+    if not offer_id:
+        _dbg("MONOPAY DEBUG: noop: no offer_id in webhook")
         return "ok"
 
-    # 4) success → отмечаем оплату, каскадно закрываем остальных при необходимости
+    # 4) тягнемо офер і реагуємо на статус
     async with async_session() as session:
         off: Offer | None = await session.get(Offer, offer_id)
         if not off:
-            _dbg("warn: offer %s not found", offer_id)
+            _dbg("MONOPAY DEBUG: noop: offer not found id=%s", offer_id)
             return "ok"
 
-        if off.invoice_id and off.invoice_id != invoice_id:
-            _dbg(
-                "warn: invoice mismatch offer=%s expected=%s got=%s",
-                offer_id, off.invoice_id, invoice_id
-            )
+        if status in ("created", "processing"):
+            _dbg("MONOPAY DEBUG: noop: status=%s", status)
             return "ok"
 
+        if status != "success":
+            _dbg("MONOPAY DEBUG: noop: status is not success: %s", status)
+            return "ok"
+
+        # 5) success -> позначаємо оплаченим
         off.status = OfferStatus.PAID
         off.paid_at = datetime.utcnow()
-        if not off.invoice_id:
-            off.invoice_id = invoice_id
-        await session.flush()
-
-        lot: Lot = await session.get(Lot, off.lot_id)
-
-        # если набрали нужное количество — закрыть активные предложения
-        paid_cnt = (await session.execute(
-            select(func.count())
-            .select_from(Offer)
-            .where(Offer.lot_id == lot.id, Offer.status == OfferStatus.PAID)
-        )).scalar_one()
-
-        if paid_cnt >= lot.quantity:
-            others = (await session.execute(
-                select(Offer).where(
-                    Offer.lot_id == lot.id,
-                    Offer.status.in_([OfferStatus.OFFERED, OfferStatus.POSTPONED])
-                )
-            )).scalars().all()
-            for o in others:
-                o.status = OfferStatus.CANCELED
-
         await session.commit()
-        _dbg("offer_id=%s marked as PAID; invoice_id=%s", offer_id, invoice_id)
+        await session.refresh(off)
 
-    # 5) пушим пользователю форму контактов через deep-link
-    try:
-        me = await bot.get_me()
-        link = f"https://t.me/{me.username}?start=contact_{offer_id}"
-        await bot.send_message(
-            off.user_tg_id,
-            f"✅ Оплату за лот #{lot.public_id} зараховано!\n"
-            f"Натисніть, щоб заповнити контактні дані: {link}"
-        )
-    except Exception as e:
-        _dbg("warn: cannot push contact form: %r", e)
+        # 6) Штовхаємо юзеру форму контактів БЕЗ ЛІНКА і ставимо FSM на one-shot
+        try:
+            ctx = dp.fsm.get_context(bot=bot, user_id=off.user_tg_id, chat_id=off.user_tg_id)
+            await ctx.set_state(ContactOneSG.ONE)
+            await ctx.update_data(offer_id=off.id)
+
+            msg = (
+                f"✅ Оплату за лот #{off.public_id} зараховано!\n\n"
+                "Відправте одним повідомленням ваші дані у довільному форматі:\n"
+                "— ПІБ\n— місто/область\n— НП/УП + відділення або адреса\n— телефон\n— коментар (за потреби)\n\n"
+                "Просто напишіть все в ОДНОМУ повідомленні у відповідь на це."
+            )
+            await bot.send_message(off.user_tg_id, msg)
+        except Exception as e:
+            _dbg("MONOPAY DEBUG: warn: cannot push contact form: %r", e)
 
     return "ok"
