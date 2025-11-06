@@ -190,7 +190,7 @@ async def _publish_lot(pub_id: int, bot: Bot) -> bool:
 
         me = await bot.get_me()
         is_sale = (lot.min_step == 0)
-        link_text = "Купити" if is_sale else "Бронь"
+        link_text = "Купити" if is_sale else "БРОНЬ"
         deeplink = f"https://t.me/{me.username}?start={'sale' if is_sale else 'lot'}_{lot.public_id}"
 
         step_line = "" if is_sale else "Крок: 15 грн\n"
