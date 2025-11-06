@@ -18,7 +18,8 @@ from app.models import Offer, OfferStatus, Lot
 from app.services.monopay import verify_webhook_signature, _dbg
 import logging, hashlib
 from datetime import datetime
-
+from fastapi import APIRouter
+from app import main as __main  # той самий файл, щоб FastAPI бачив app
 
 dbg_logger = logging.getLogger("app.monopay")
 logging.basicConfig(level=logging.INFO)
